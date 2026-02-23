@@ -845,10 +845,20 @@ bool CPU::bios_b_call(u32 fn) noexcept {
 //   A(0x3C) = putchar(c)          → output one character
 //   A(0x3E) = puts(s)             → output null-terminated string + newline
 //   A(0x3F) = printf(fmt, ...)    → formatted output
+//   A(0x40) = hookUnresolvedExceptionHandler(fn) → stores fn in RAM[0x300]
 // All other function numbers are silently no-ops (the existing jr-$ra stub
 // in RAM still handles the return path correctly).
 void CPU::bios_a_call(u32 fn) noexcept {
     switch (fn) {
+    case 0x40u: {  // hookUnresolvedExceptionHandler(fn) — $a0 = handler pointer
+        // Stores the exception handler in the A0 globals table slot at 0x0300
+        // (A0 table base 0x0200 + index 0x40 * 4 = 0x0300).
+        // handle_non_irq_exception() reads this address when a non-IRQ exception fires.
+        const u32 old = bus_.read<u32>(0x0300u);
+        bus_.write<u32>(0x0300u, gpr_[4]);
+        gpr_[2] = old;  // return previously registered handler
+        break;
+    }
     case 0x3Cu: {  // putchar(c) — $a0 = character
         bus_.tty_putchar(static_cast<char>(gpr_[4]));
         gpr_[2] = gpr_[4];  // return value = the character
