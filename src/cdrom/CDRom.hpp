@@ -1,0 +1,127 @@
+#pragma once
+
+#include <array>
+#include <cstdio>
+#include "common/Types.hpp"
+#include "irq/IRQ.hpp"
+
+// ── CD-ROM Controller ─────────────────────────────────────────────────────────
+// Registers live at 0x1F80_1800 – 0x1F80_1803 (byte-wide).
+//
+//   0x1F801800  (R) Status register   (W) Index register [1:0]
+//   0x1F801801  (R) Response FIFO     (W, idx 0) Command register
+//   0x1F801802  (R) Data FIFO         (W, idx 0) Parameter FIFO
+//   0x1F801803  (R, idx 0) IRQ Enable (W, idx 0) IRQ Enable
+//               (R, idx 1) IRQ Flags  (W, idx 1) IRQ Flags (write-1-to-clear)
+//
+// Status byte (0x1F801800 read)
+//   bit 2  ADPBUSY   XA-ADPCM busy
+//   bit 3  PRMEMPT   Parameter FIFO empty     (1 = empty)
+//   bit 4  PRMWRDY   Parameter FIFO not full  (1 = writable)
+//   bit 5  RSLRRDY   Response FIFO not empty  (1 = data ready)
+//   bit 6  DRQSTS    Data FIFO not empty
+//   bit 7  BUSYSTS   Busy
+//
+// CD stat byte (returned in response FIFO)
+//   bit 0  ERROR       an error occurred
+//   bit 1  MOTOR_ON    spindle motor is on
+//   bit 2  SEEKERROR   seek failed
+//   bit 3  IDERROR     cannot detect disc (no disc)
+//   bit 4  SHELL_OPEN  lid is open
+//   bit 5  READING     reading data
+//   bit 6  SEEKING     seeking
+//   bit 7  PLAYING     playing audio
+//
+// Interrupt types in irq_fl_:
+//   INT1  Data ready (sector in buffer)
+//   INT2  Second completion response (Pause, Stop, Seek, …)
+//   INT3  Acknowledge of first response (most commands)
+//   INT4  Data end
+//   INT5  Error
+// ─────────────────────────────────────────────────────────────────────────────
+class CDRom {
+public:
+    explicit CDRom(IRQ& irq) noexcept : irq_(irq) {}
+    ~CDRom() noexcept { if (disc_) std::fclose(disc_); }
+
+    // ── Bus interface: byte-wide reads/writes at offsets 0–3 ─────────────────
+    [[nodiscard]] u8 read (u32 off) const noexcept;   // const: resp_pos_ mutable
+    void             write(u32 off, u8  value) noexcept;
+
+    // ── Disc image ────────────────────────────────────────────────────────────
+    // Load a .bin (2352 B/sector raw) or .iso (2048 B/sector) disc image.
+    // Returns true on success; without a disc the controller reports lid-open.
+    bool load_disc(const char* path) noexcept;
+
+    // ── DMA ch3 interface ─────────────────────────────────────────────────────
+    // Called by DMA channel 3 to drain the sector data buffer word by word.
+    [[nodiscard]] u32 read_data_word() noexcept;
+
+private:
+    IRQ& irq_;
+
+    u8 index_  = 0;       // current register bank [1:0]
+    u8 irq_en_ = 0;       // IRQ enable mask [4:0]
+    u8 irq_fl_ = 0;       // pending INT type [2:0]  (0 = none)
+
+    // ── CD stat / mode ────────────────────────────────────────────────────────
+    u8 cd_stat_ = 0x10u;  // default: SHELL_OPEN; set to 0x02 after load_disc()
+    u8 mode_    = 0x20u;  // Setmode byte (0x20 = double-speed)
+
+    // ── First response FIFO (up to 8 bytes) ───────────────────────────────────
+    std::array<u8, 8> resp_{};
+    u8            resp_len_     = 0;
+    mutable u8    resp_pos_     = 0;   // mutable so read() can be const
+
+    // ── Deferred second response ───────────────────────────────────────────────
+    // Fired when the BIOS acknowledges the first INT by clearing irq_fl_.
+    std::array<u8, 8> resp2_{};
+    u8 resp2_len_  = 0;
+    u8 resp2_type_ = 0;
+
+    // ── Parameter FIFO (written before each command) ───────────────────────────
+    std::array<u8, 8> params_{};
+    u8 param_len_ = 0;
+
+    // ── Disc image ─────────────────────────────────────────────────────────────
+    std::FILE* disc_     = nullptr;
+    bool       disc_bin_ = false;    // true = 2352 B/sector BIN; false = ISO 2048
+    u32        seek_lba_ = 0;        // target LBA saved by Setloc
+
+    // ── Sector data buffer (for DMA ch3 readback) ─────────────────────────────
+    static constexpr u32 SECTOR_SIZE = 2048u;
+    std::array<u8, SECTOR_SIZE> data_buf_{};
+    u32  data_pos_   = 0;          // byte cursor (advanced by read_data_word)
+    bool data_ready_ = false;      // sector filled and INT1 pending/fired
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    [[nodiscard]] u8 status() const noexcept;
+
+    // Push an N-byte first response and fire the CDRom IRQ.
+    void push_response_n(u8 int_type, const u8* data, u32 len) noexcept;
+
+    // Convenience: push a single-byte response.
+    void push_response1(u8 int_type, u8 byte0) noexcept {
+        push_response_n(int_type, &byte0, 1u);
+    }
+
+    // Queue a deferred N-byte second response (fired on INT3 acknowledge).
+    void defer_response_n(u8 int_type, const u8* data, u32 len) noexcept;
+
+    // Read 2048 bytes at seek_lba_ from the disc image into data_buf_.
+    // Advances seek_lba_ by 1 on success.
+    bool read_sector() noexcept;
+
+    void handle_command(u8 cmd) noexcept;
+
+    // Decode one BCD byte to binary.
+    static u32 from_bcd(u8 v) noexcept {
+        return static_cast<u32>(v >> 4u) * 10u + static_cast<u32>(v & 0xFu);
+    }
+
+    // Convert MSF (three BCD bytes) to a disc LBA.
+    // LBA 0 = MSF 00:02:00 (first user-data sector, 150 frames after the lead-in).
+    static u32 msf_to_lba(u8 m, u8 s, u8 f) noexcept {
+        return (from_bcd(m) * 60u + from_bcd(s)) * 75u + from_bcd(f) - 150u;
+    }
+};

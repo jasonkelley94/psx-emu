@@ -1,0 +1,6 @@
+build/
+*.ppm
+*.o
+*.a
+*.so
+.cache/
