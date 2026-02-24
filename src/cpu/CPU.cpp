@@ -37,6 +37,22 @@ void CPU::check_irq() noexcept {
     //   3. The corresponding IP bit is set  (IP[2], bit 10)
     // We check IM & IP with an 8-bit mask covering bits [15:8].
     if (cop0_.ie_current() && (cop0_.sr & cop0_.cause & 0xFF00u)) {
+        // Temporary debug: log IRQs around the hang point
+        static int irq_log_count = 0;
+        ++irq_log_count;
+        if (irq_log_count <= 5 || (irq_log_count >= 50 && irq_log_count <= 60)) {
+            std::fprintf(stderr, "[IRQ#%d] PC=0x%08X I_STAT=0x%04X I_MASK=0x%04X SR=0x%08X\n",
+                irq_log_count, pc_,
+                bus_.irq().read_stat(), bus_.irq().read_mask(), cop0_.sr);
+        }
+        if (irq_log_count == 60) {
+            std::fprintf(stderr, "[IRQ] ... (logging paused, resuming at #1000)\n");
+        }
+        if (irq_log_count >= 1000 && irq_log_count <= 1005) {
+            std::fprintf(stderr, "[IRQ#%d] PC=0x%08X I_STAT=0x%04X I_MASK=0x%04X SR=0x%08X\n",
+                irq_log_count, pc_,
+                bus_.irq().read_stat(), bus_.irq().read_mask(), cop0_.sr);
+        }
         // pc_ is the instruction that would have executed if no IRQ.
         // in_delay_slot_ (set by the previous execute()) tells us if pc_ is
         // in a branch delay slot: if so EPC = branch address = pc_ - 4, BD=1.

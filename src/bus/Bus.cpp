@@ -251,6 +251,7 @@ void Bus::tty_putchar(char c) noexcept {
     if (c == '\n' || pos >= 254) {
         buf[pos] = '\0';
         std::fprintf(stdout, "[TTY] %s\n", buf);
+        std::fflush(stdout);
         pos = 0;
     } else {
         buf[pos++] = c;
@@ -556,26 +557,48 @@ Bus::PsxExeInfo Bus::sideload(const char* path) noexcept {
 
 // ── Bus::tick() ───────────────────────────────────────────────────────────────
 // Called once per CPU instruction (≈1 system-clock cycle for our purposes).
-// Advances root counters, generates HBlank pulses (263/frame) and VBlank IRQ.
+// Generates HBlank begin/end and VBlank begin/end events for timer sync modes.
 void Bus::tick(u32 cycles) noexcept {
-    // ── HBlank pulses ─────────────────────────────────────────────────────────
-    // One HBlank per scanline; 263 scanlines per NTSC frame → period ≈ 380 cycles.
+    // ── HBlank timing ─────────────────────────────────────────────────────────
     hblank_cycles_ += cycles;
     while (hblank_cycles_ >= kHBlankPeriod) {
         hblank_cycles_ -= kHBlankPeriod;
-        timers_->hblank_tick();
+        if (!in_hblank_) {
+            in_hblank_     = true;
+            hblank_active_ = 0;
+            timers_->hblank_begin();
+        }
+    }
+    if (in_hblank_) {
+        hblank_active_ += cycles;
+        if (hblank_active_ >= kHBlankDuration) {
+            in_hblank_     = false;
+            hblank_active_ = 0;
+            timers_->hblank_end();
+        }
     }
 
     // ── Root counters (sys clock, dotclock, sys/8) ────────────────────────────
     timers_->tick(cycles);
 
-    // ── VBlank IRQ — fires every kVBlankPeriod cycles (~100,000) ─────────────
+    // ── VBlank timing ─────────────────────────────────────────────────────────
     vblank_cycles_ += cycles;
     if (vblank_cycles_ >= kVBlankPeriod) {
         vblank_cycles_ -= kVBlankPeriod;
-        irq_->set(IRQSource::VBlank);
-        timers_->vblank_tick();
-        // Toggle GPUSTAT bit 31 (even/odd field in interlace; changes at VBlank)
-        gpu_->toggle_field();
+        if (!in_vblank_) {
+            in_vblank_     = true;
+            vblank_active_ = 0;
+            irq_->set(IRQSource::VBlank);
+            timers_->vblank_begin();
+            gpu_->toggle_field();
+        }
+    }
+    if (in_vblank_) {
+        vblank_active_ += cycles;
+        if (vblank_active_ >= kVBlankDuration) {
+            in_vblank_     = false;
+            vblank_active_ = 0;
+            timers_->vblank_end();
+        }
     }
 }

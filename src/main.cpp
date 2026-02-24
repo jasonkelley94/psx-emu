@@ -127,6 +127,8 @@ int main(int argc, char* argv[]) {
         u32      prev_pc = ~0u;
         int      same_pc = 0;
 
+        u32 trace_prev_pc = 0;
+        uint64_t trace_count = 0;
         while (max_cycles == 0u || cycles < max_cycles) {
             if (!cpu->step()) {
                 std::fprintf(stderr, "CPU halted at PC=0x%08X\n", cpu->pc());
@@ -134,6 +136,21 @@ int main(int argc, char* argv[]) {
             }
             ++cycles;
             bus->tick();
+
+            // PC frequency trace every 10M cycles
+            if (cycles % 10000000u == 0u) {
+                if (cpu->pc() == trace_prev_pc) {
+                    ++trace_count;
+                    if (trace_count <= 5u)
+                        std::fprintf(stderr, "[TRACE] %lluM: PC=0x%08X (stuck)\n",
+                                     static_cast<unsigned long long>(cycles / 1000000u), cpu->pc());
+                } else {
+                    trace_count = 0;
+                    std::fprintf(stderr, "[TRACE] %lluM: PC=0x%08X\n",
+                                 static_cast<unsigned long long>(cycles / 1000000u), cpu->pc());
+                }
+                trace_prev_pc = cpu->pc();
+            }
 
             // Detect spin loop (j $pc with NOP delay slot → PC oscillates).
             if (cpu->pc() == prev_pc) {

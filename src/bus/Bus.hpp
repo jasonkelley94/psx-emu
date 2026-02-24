@@ -94,15 +94,20 @@ private:
     std::array<u8, SPU_REG_SIZE> spu_regs_{};
 
     // VBlank generation — fire IRQ0 every ~100,000 cycles.
-    // PSN00BSDK's VSync() busy-wait times out after ~105,707 emulated cycles, so we
-    // fire VBlank at 100,000 < 105,707 to make VSync() succeed before its timeout.
-    // This matches the effective frame period of the reference emulator (~112K).
-    static constexpr u32 kVBlankPeriod = 100'000u;
-    u32 vblank_cycles_ = 0;
+    static constexpr u32 kVBlankPeriod    = 100'000u;
+    // VBlank active duration: ~5% of frame (~10 scanlines of the 263 total).
+    static constexpr u32 kVBlankDuration  = kVBlankPeriod * 10u / 263u;  // ~3802
+    u32 vblank_cycles_  = 0;
+    u32 vblank_active_  = 0;   // cycles since VBlank start; 0 = outside VBlank
+    bool in_vblank_     = false;
 
-    // HBlank generation — fire one HBlank pulse per scanline (263 per NTSC frame).
-    static constexpr u32 kHBlankPeriod = kVBlankPeriod / 263u;  // ≈380 cycles
-    u32 hblank_cycles_ = 0;
+    // HBlank generation — one pulse per scanline (263 per NTSC frame, ≈380 cycles).
+    static constexpr u32 kHBlankPeriod   = kVBlankPeriod / 263u;  // ≈380 cycles
+    // HBlank active duration: ~18% of scanline.
+    static constexpr u32 kHBlankDuration = kHBlankPeriod * 18u / 100u;  // ≈68 cycles
+    u32 hblank_cycles_  = 0;
+    u32 hblank_active_  = 0;   // cycles since HBlank start; 0 = outside HBlank
+    bool in_hblank_     = false;
 
     // ── MMIO helpers ─────────────────────────────────────────────────────────
     // Most I/O registers are 32-bit wide; the CD-ROM is the exception (8-bit).

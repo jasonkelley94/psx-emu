@@ -15,7 +15,8 @@
 //   +0x8  Target value   (16-bit, read/write)
 //
 // Selected mode bits:
-//   [2:1] Sync mode      (meaning depends on timer)
+//   [0]   Sync enable      (0 = free-run; 1 = sync mode active)
+//   [2:1] Sync mode        (meaning depends on timer, see below)
 //   [3]   Reset on target  (0 = free-run to 0xFFFF; 1 = reset to 0 on target)
 //   [4]   IRQ on target reach
 //   [5]   IRQ on counter overflow (0xFFFF → 0)
@@ -24,6 +25,23 @@
 //   [9]   Clock source (Timer2: 0/1=sys, 1x=sys/8)
 //   [11]  TargetReached    (set when counter == target; cleared on mode read/write)
 //   [12]  OverflowReached  (set when counter overflows; cleared on mode read/write)
+//
+// Sync modes per timer:
+//   Timer 0 (HBlank):
+//     0 = Pause counter during HBlank
+//     1 = Reset counter to 0 at HBlank start
+//     2 = Reset to 0 at HBlank start AND pause outside HBlank
+//     3 = Pause until first HBlank occurs, then free-run
+//   Timer 1 (VBlank):
+//     0 = Pause counter during VBlank
+//     1 = Reset counter to 0 at VBlank start
+//     2 = Reset to 0 at VBlank start AND pause outside VBlank
+//     3 = Pause until first VBlank occurs, then free-run
+//   Timer 2 (no H/V sync — uses internal gate only):
+//     0 = Stop counter permanently
+//     1 = Free run
+//     2 = Free run
+//     3 = Stop counter permanently
 //
 // Clock sources per timer:
 //   Timer 0: mode[8]=0 → system clock, mode[8]=1 → dotclock (~sys/5 for 320x240)
@@ -41,13 +59,13 @@ public:
     // ── Advance all counters by `cycles` system clock ticks ──────────────────
     void tick(u32 cycles) noexcept;
 
-    // ── HBlank pulse — called once per scanline (~380 sys cycles in NTSC) ────
-    // Timer1 in HBlank mode increments its counter by 1 here.
-    void hblank_tick() noexcept;
+    // ── HBlank events — called by Bus at start/end of each HBlank ────────────
+    void hblank_begin() noexcept;
+    void hblank_end()   noexcept;
 
-    // ── VBlank pulse — called once per frame ─────────────────────────────────
-    // Used for Timer1 sync modes (pause/reset on VBlank).
-    void vblank_tick() noexcept;
+    // ── VBlank events — called by Bus at start/end of each VBlank ────────────
+    void vblank_begin() noexcept;
+    void vblank_end()   noexcept;
 
 private:
     IRQ& irq_;
@@ -66,20 +84,23 @@ private:
         // we keep counter == target for 1 clock so software can observe the value.
         // On the NEXT advance() call, the reset is applied before incrementing.
         bool pending_reset = false;
+        // For sync mode 3 (T0/T1): pause until first blank, then free-run.
+        // Set to true on first hblank_begin()/vblank_begin() after mode write.
+        bool sync3_released = false;
     };
     std::array<Timer, 3> tmr_{};
 
+    // Current blanking state — updated by hblank_begin/end and vblank_begin/end.
+    bool in_hblank_ = false;
+    bool in_vblank_ = false;
+
     // Fractional accumulators for sub-integer clock sources.
-    // Fixed-point with kFracBits fractional bits.
-    static constexpr u32 kFracBits = 8u;
-    static constexpr u32 kFracOne  = 1u << kFracBits;  // 256
+    u32 dot_frac_  = 0;   // Timer0 dotclock accumulator
+    u32 sys8_frac_ = 0;   // Timer2 sys/8 accumulator
 
-    // Timer0 dotclock: GPU pixel clock ≈ sys * 11 / 7 / dot_div
-    // For 320x240 (dot_div=8): sys * 11/56 ≈ sys/5.09 → 198 dots per 1000 sys
-    u32 dot_frac_ = 0;   // fractional accumulator (accumulated * 11 / 7 / dot_div)
-
-    // Timer2 sys/8: 1 tick every 8 sys clocks
-    u32 sys8_frac_ = 0;  // fractional accumulator
+    // Helper: extract sync_enable (bit 0) and sync_mode (bits [2:1]).
+    static bool sync_enable(u32 mode) noexcept { return mode & 1u; }
+    static u32  sync_mode  (u32 mode) noexcept { return (mode >> 1u) & 3u; }
 
     // Advances a single timer counter by `ticks`, handling target/overflow IRQs.
     void advance(u32 n, u32 ticks) noexcept;
