@@ -58,6 +58,12 @@ public:
     // Called by DMA channel 3 to drain the sector data buffer word by word.
     [[nodiscard]] u32 read_data_word() noexcept;
 
+    // ── XA PCM output ─────────────────────────────────────────────────────────
+    // Drain up to `n` stereo pairs (L, R, L, R, …) from the XA ring buffer into
+    // `dst`.  Returns the number of pairs actually written.  Intended for an
+    // SDL audio callback; safe to ignore entirely in headless mode.
+    u32 xa_drain(int16_t* dst, u32 n) noexcept;
+
     // ── Timing tick ───────────────────────────────────────────────────────────
     // Called from Bus::tick() to advance pending CDROM response delays.
     void tick(u32 cycles) noexcept;
@@ -76,6 +82,21 @@ private:
     // ── XA-ADPCM filter (Setfilter 0x0D) ─────────────────────────────────────
     u8 xa_file_    = 0u;
     u8 xa_channel_ = 0u;
+
+    // ── XA-ADPCM decoder state ────────────────────────────────────────────────
+    // Two filter history samples per channel (L=0, R=1); preserved across sectors
+    // so the IIR filter doesn't glitch at sector boundaries.
+    struct XaAdpcmState {
+        int32_t prev[2][2] = {};  // [channel][0=newest, 1=oldest]
+    };
+    XaAdpcmState xa_adpcm_{};
+
+    // ── XA PCM ring buffer (stereo int16, L/R interleaved) ────────────────────
+    // 4096 stereo pairs ≈ one XA sector of audio; wraps on overflow (old data
+    // silently overwritten).  Drained by xa_drain() for future SDL output.
+    static constexpr u32 kXaBufSamples = 4096u;
+    std::array<int16_t, kXaBufSamples * 2u> xa_pcm_{};
+    u32 xa_pcm_wr_ = 0u;   // write index in stereo pairs
 
     // ── First response FIFO (up to 8 bytes) ───────────────────────────────────
     std::array<u8, 8> resp_{};
@@ -156,6 +177,11 @@ private:
     // Read 2048 bytes at seek_lba_ from the disc image into data_buf_.
     // Advances seek_lba_ by 1 on success.
     bool read_sector() noexcept;
+
+    // Decode one 2352-byte raw sector's XA-ADPCM payload into xa_pcm_.
+    // sector_off: byte offset of this sector's first byte within the file.
+    // coding:     Coding Info byte from the sub-header.
+    void xa_decode_sector(std::FILE* fh, long sector_off, u8 coding) noexcept;
 
     void handle_command(u8 cmd) noexcept;
 

@@ -29,6 +29,40 @@ static constexpr u32 kSectN_1x=  447'600u;   // per sector, 1×
 static constexpr u32 kSect1_2x=3'000'000u;   // first sector, 2×
 static constexpr u32 kSectN_2x=  223'000u;   // per sector, 2×
 
+// ── XA-ADPCM filter coefficients (Q6 fixed-point, identical to SPU ADPCM) ────
+// s += (k0 * prev0 + k1 * prev1 + 32) >> 6
+static constexpr int32_t kXaK[4][2] = {
+    {   0,   0 },
+    {  60,   0 },
+    { 115, -52 },
+    {  98, -55 },
+};
+
+// Decode one 14-byte ADPCM block into 28 int16_t samples.
+// shift/filter are taken from the sound-group parameter byte.
+// prev[0] = history sample n-1, prev[1] = history sample n-2 (updated in-place).
+static void xa_decode_block(const u8* data, u32 shift, u32 filter,
+                              int32_t prev[2], int16_t* out) noexcept {
+    const int32_t k0 = kXaK[filter & 3u][0];
+    const int32_t k1 = kXaK[filter & 3u][1];
+    const int32_t rs = (shift > 12u) ? 12u : (int32_t)shift;  // clamp (corrupt disc guard)
+
+    for (u32 i = 0u; i < 28u; ++i) {
+        const u8 byte   = data[i >> 1u];
+        const u8 nibble = (i & 1u) ? (byte >> 4u) : (byte & 0xFu);
+
+        // Sign-extend 4-bit nibble to int16 by placing it in the top nibble,
+        // then arithmetic-right-shift by the block's range factor.
+        int32_t s = (int32_t)(int16_t)((uint16_t)(nibble << 12u)) >> rs;
+        s += (k0 * prev[0] + k1 * prev[1] + 32) >> 6;
+        s  = (s < -32768) ? -32768 : (s > 32767) ? 32767 : s;
+
+        out[i]  = (int16_t)s;
+        prev[1] = prev[0];
+        prev[0] = s;
+    }
+}
+
 // ── Multi-byte response + fire CDRom IRQ immediately ─────────────────────────
 void CDRom::push_response_n(u8 int_type, const u8* data, u32 len) noexcept {
     resp_len_ = static_cast<u8>(len < 8u ? len : 8u);
@@ -356,20 +390,48 @@ bool CDRom::read_sector() noexcept {
         return true;
     }
 
-    // Compute byte offset into the track's file:
-    //   file_off  = byte offset to INDEX 01 sector of this track
-    //   + (lba - disc_lba) sectors past the track start
-    //   + user_skip bytes of raw sector header to skip
-    const long off = t->file_off
-                   + static_cast<long>(seek_lba_ - t->disc_lba)
-                     * static_cast<long>(t->sect_size)
-                   + static_cast<long>(t->user_skip);
+    // Byte offset of the first byte of this raw sector in the file.
+    const long sector_start = t->file_off
+                            + static_cast<long>(seek_lba_ - t->disc_lba)
+                              * static_cast<long>(t->sect_size);
 
+    // For raw Mode-2 sectors (2352 B), peek at the 8-byte sub-header at
+    // bytes 16–23 (after 12-byte sync + 4-byte header) to check for XA audio.
+    if (t->sect_size == 2352u && !t->audio) {
+        u8 subhdr[8] = {};
+        if (std::fseek(t->fh, sector_start + 16L, SEEK_SET) == 0) {
+            [[maybe_unused]] auto _r = std::fread(subhdr, 1u, 8u, t->fh);
+        }
+
+        const u8 submode = subhdr[2];
+        const u8 coding  = subhdr[3];
+
+        // bit 2 of submode = Audio sector (XA-ADPCM); mode_ bit 5 = CDXA enable.
+        if ((submode & 0x04u) != 0u && (mode_ & 0x20u) != 0u) {
+            // XA file/channel filter — mode_ bit 3 enables it.
+            const bool pass = !(mode_ & 0x08u)
+                           || (subhdr[0] == xa_file_ && subhdr[1] == xa_channel_);
+            if (pass) {
+                cd_stat_ |=  0x04u;  // set ADPBUSY (bit 2)
+                xa_decode_sector(t->fh, sector_start, coding);
+            }
+            // XA sectors do NOT fill data_buf_; INT1 fires with ADPBUSY set.
+            seek_lba_++;
+            loc_lba_  = seek_lba_ - 1;
+            loc_valid_ = pos_valid_ = true;
+            pos_lba_   = loc_lba_;
+            return true;
+        }
+    }
+
+    // Normal data sector: skip the raw preamble and read 2048 user bytes.
+    const long off = sector_start + static_cast<long>(t->user_skip);
     if (std::fseek(t->fh, off, SEEK_SET) != 0) return false;
     const u32 got = static_cast<u32>(
         std::fread(data_buf_.data(), 1u, SECTOR_SIZE, t->fh));
     if (got < SECTOR_SIZE) return false;
 
+    cd_stat_ &= ~0x04u;  // clear ADPBUSY on data sectors
     data_pos_   = 0u;
     data_ready_ = true;
     seek_lba_  += 1;
@@ -378,6 +440,99 @@ bool CDRom::read_sector() noexcept {
     pos_valid_  = true;
     pos_lba_    = loc_lba_;
     return true;
+}
+
+// ── XA-ADPCM sector decode ────────────────────────────────────────────────────
+// Reads 2304 bytes (18 × 128-byte sound groups) from the raw sector payload
+// (starting at sector_off + 24) and pushes decoded stereo int16 samples into
+// the xa_pcm_ ring buffer.
+//
+// Sound-group layout (128 bytes, 4-bit ADPCM):
+//   Bytes  0-7  : Sound parameters for blocks 0–7 (one byte each)
+//   Bytes  8-15 : Copy of bytes 0-7 (used for error detection on real hardware)
+//   Bytes 16-127: 8 × 14 bytes of 4-bit sample data (28 nibbles per block)
+//
+// Stereo interleaving: even blocks (0,2,4,6) → left channel,
+//                      odd blocks  (1,3,5,7) → right channel.
+// Mono: all 8 blocks are output as the single channel (duplicated to L and R).
+void CDRom::xa_decode_sector(std::FILE* fh, long sector_off, u8 coding) noexcept {
+    const bool stereo = (coding & 0x01u) != 0u;
+    // coding bit 4 = 8-bit samples (rare); we only handle 4-bit here.
+    if (coding & 0x10u) return;   // 8-bit XA — skip for now
+
+    // Read the audio payload: 18 sound groups × 128 bytes = 2304 bytes.
+    // Starts right after the 24-byte raw-sector preamble (sync+header+subheader).
+    static constexpr u32 kPayload = 2304u;
+    std::array<u8, kPayload> buf;
+    if (std::fseek(fh, sector_off + 24L, SEEK_SET) != 0) return;
+    if (std::fread(buf.data(), 1u, kPayload, fh) < kPayload) return;
+
+    int16_t tmp_l[28], tmp_r[28];
+
+    for (u32 sg = 0u; sg < 18u; ++sg) {
+        const u8* grp = buf.data() + sg * 128u;
+
+        // Process 8 blocks in pairs (even=L, odd=R for stereo; both=mono otherwise).
+        for (u32 blk = 0u; blk < 8u; blk += 2u) {
+            // Decode even (left / mono) block.
+            const u8  pl     = grp[blk];
+            const u32 sl     = pl & 0xFu;
+            const u32 fl     = (pl >> 4u) & 0x3u;
+            xa_decode_block(grp + 16u + blk * 14u, sl, fl,
+                            xa_adpcm_.prev[0], tmp_l);
+
+            if (stereo) {
+                // Decode odd (right) block.
+                const u8  pr = grp[blk + 1u];
+                const u32 sr = pr & 0xFu;
+                const u32 fr = (pr >> 4u) & 0x3u;
+                xa_decode_block(grp + 16u + (blk + 1u) * 14u, sr, fr,
+                                xa_adpcm_.prev[1], tmp_r);
+
+                for (u32 i = 0u; i < 28u; ++i) {
+                    const u32 wp = xa_pcm_wr_ & (kXaBufSamples - 1u);
+                    xa_pcm_[wp * 2u    ] = tmp_l[i];
+                    xa_pcm_[wp * 2u + 1u] = tmp_r[i];
+                    xa_pcm_wr_ = (xa_pcm_wr_ + 1u) & (kXaBufSamples - 1u);
+                }
+            } else {
+                // Mono: output even block (L dup'd to R), then odd block.
+                for (u32 i = 0u; i < 28u; ++i) {
+                    const u32 wp = xa_pcm_wr_ & (kXaBufSamples - 1u);
+                    xa_pcm_[wp * 2u    ] = tmp_l[i];
+                    xa_pcm_[wp * 2u + 1u] = tmp_l[i];
+                    xa_pcm_wr_ = (xa_pcm_wr_ + 1u) & (kXaBufSamples - 1u);
+                }
+                // Decode and output odd (mono) block.
+                const u8  pr = grp[blk + 1u];
+                const u32 sr = pr & 0xFu;
+                const u32 fr = (pr >> 4u) & 0x3u;
+                xa_decode_block(grp + 16u + (blk + 1u) * 14u, sr, fr,
+                                xa_adpcm_.prev[0], tmp_r);
+                for (u32 i = 0u; i < 28u; ++i) {
+                    const u32 wp = xa_pcm_wr_ & (kXaBufSamples - 1u);
+                    xa_pcm_[wp * 2u    ] = tmp_r[i];
+                    xa_pcm_[wp * 2u + 1u] = tmp_r[i];
+                    xa_pcm_wr_ = (xa_pcm_wr_ + 1u) & (kXaBufSamples - 1u);
+                }
+            }
+        }
+    }
+}
+
+// ── XA PCM drain ──────────────────────────────────────────────────────────────
+u32 CDRom::xa_drain(int16_t* dst, u32 n) noexcept {
+    // Compute available stereo pairs (ring buffer write minus read, mod size).
+    // xa_pcm_rd_ is a local read cursor (caller's position).
+    // In the headless build nobody calls this; it's here for future SDL use.
+    const u32 avail = xa_pcm_wr_ & (kXaBufSamples - 1u);  // simplified: always full
+    const u32 count = (n < avail) ? n : avail;
+    for (u32 i = 0u; i < count; ++i) {
+        const u32 rp = (xa_pcm_wr_ - count + i) & (kXaBufSamples - 1u);
+        dst[i * 2u    ] = xa_pcm_[rp * 2u    ];
+        dst[i * 2u + 1u] = xa_pcm_[rp * 2u + 1u];
+    }
+    return count;
 }
 
 // ── DMA ch3: drain one 32-bit word from the sector buffer ────────────────────
@@ -440,7 +595,7 @@ void CDRom::handle_command(u8 cmd) noexcept {
     // ── 0x09 Pause ───────────────────────────────────────────────────────────
     case 0x09:
         reading_ = false;
-        cd_stat_ = static_cast<u8>(cd_stat_ & 0xDFu);  // clear READING
+        cd_stat_ = static_cast<u8>(cd_stat_ & ~(0x20u | 0x04u));  // clear READING + ADPBUSY
         sched1(3u, cd_stat_, kAck1);
         sched2(2u, &cd_stat_, 1u, kD2Pause);
         break;
