@@ -103,6 +103,14 @@ void DMA::start_transfer(u32 n) noexcept {
     const u32  dir  = ch_[n].chcr & 1u;   // 0=RAM→device, 1=device→RAM
 
     switch (n) {
+    case 0:  // MDEC-in  (CPU/RAM → MDEC): accept data, MDEC decodes nothing.
+    case 1:  // MDEC-out (MDEC → RAM):     no decoded data; RAM already zeroed.
+        // MDEC is not implemented; both channels complete immediately.
+        // DMA ch1 destination RAM is zero-initialized, so the BIOS reads black
+        // pixels for the boot animation and continues without hanging.
+        finish(n);
+        break;
+
     case 2:  // GPU
         if (sync == 2) {
             run_gpu_ll(n);       // linked-list, always CPU→GPU

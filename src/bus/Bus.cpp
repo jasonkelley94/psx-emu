@@ -113,6 +113,11 @@ u32 Bus::io_read32(u32 phys) const noexcept {
         return v;
     }
 
+    // ── MDEC (0x1F801820–0x1F801824) — status / control ──────────────────────
+    // Status register (0x820): bit 30 = Command Busy (0=idle), bit 29 = DMA-In req,
+    // bit 28 = DMA-Out req.  Return 0x00000000 so the BIOS sees MDEC as idle.
+    if (off == 0x820u || off == 0x824u) return 0x00000000u;
+
     std::fprintf(stderr, "[Bus] unhandled I/O read32  off=0x%04X\n", off);
     return 0xFFFF'FFFFu;
 }
@@ -174,6 +179,9 @@ void Bus::io_write32(u32 phys, u32 value) noexcept {
     if (off >= 0x1000u && off < 0x2000u) {
         return;
     }
+
+    // ── MDEC (0x1F801820–0x1F801824) — command / control (silently swallow) ───
+    if (off == 0x820u || off == 0x824u) return;
 
     std::fprintf(stderr, "[Bus] unhandled I/O write32 off=0x%04X val=0x%08X\n", off, value);
 }
