@@ -46,6 +46,27 @@ public:
         return vram_;
     }
 
+    // Active display area in VRAM (set by GP1(05) / GP1(07) / GP1(08)).
+    [[nodiscard]] u32 disp_start_x() const noexcept { return disp_x_; }
+    [[nodiscard]] u32 disp_start_y() const noexcept { return disp_y_; }
+
+    // Horizontal resolution derived from GPUSTAT[18:16] (mirrors dot_divisor()).
+    [[nodiscard]] u32 disp_width() const noexcept {
+        if ((gpustat_ >> 16u) & 1u) return 368u;   // hres2 → 368px
+        switch ((gpustat_ >> 17u) & 3u) {           // hres1
+        case 0:  return 256u;
+        case 1:  return 320u;
+        case 2:  return 512u;
+        default: return 640u;
+        }
+    }
+
+    // Vertical height: vert2 − vert1, doubled if interlaced (GPUSTAT[22]).
+    [[nodiscard]] u32 disp_height() const noexcept {
+        const u32 h = (disp_v2_ > disp_v1_) ? (disp_v2_ - disp_v1_) : 240u;
+        return ((gpustat_ >> 22u) & 1u) ? h * 2u : h;  // ×2 if interlaced
+    }
+
     // ── VBlank field toggle ───────────────────────────────────────────────────
     // Called by Bus::tick() at each VBlank.  Toggles GPUSTAT bit 31
     // (even/odd interlace field) so software polling this bit can detect frames.
@@ -85,6 +106,12 @@ private:
     u32 draw_area_tl_ = 0;   // GP0(E3)
     u32 draw_area_br_ = 0;   // GP0(E4)
     u32 draw_offset_  = 0;   // GP0(E5)
+
+    // GP1 display area registers.
+    u32 disp_x_  = 0u;    // GP1(05): display start X in VRAM (even, 0–1022)
+    u32 disp_y_  = 0u;    // GP1(05): display start Y in VRAM (0–511)
+    u32 disp_v1_ = 16u;   // GP1(07): first displayed scanline (NTSC default)
+    u32 disp_v2_ = 256u;  // GP1(07): scanline after last    (240 active lines)
 
     // GP1(09) "Allow Texture Disable" — when false, E1 bit 11 cannot set
     // GPUSTAT[15].  Disabling does NOT clear the bit (it stays until E1 clears it).

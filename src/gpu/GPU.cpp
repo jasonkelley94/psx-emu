@@ -817,9 +817,15 @@ void GPU::gp1(u32 value) noexcept {
         update_dma_request();
         break;
 
-    case 0x05: break;   // Start of display area (no renderer)
-    case 0x06: break;   // Horizontal display range (ignored)
-    case 0x07: break;   // Vertical display range (ignored)
+    case 0x05:          // GP1(05) — Display start in VRAM
+        disp_x_ =  param        & 0x3FEu;  // bits[9:1]×2, must be even
+        disp_y_ = (param >> 10) & 0x1FFu;  // bits[18:10]
+        break;
+    case 0x06: break;   // Horizontal display range — width via GP1(08) mode bits
+    case 0x07:          // GP1(07) — Vertical display range
+        disp_v1_ =  param        & 0x3FFu;  // bits[9:0]:  first displayed line
+        disp_v2_ = (param >> 10) & 0x3FFu;  // bits[19:10]: line after last
+        break;
 
     case 0x08: {
         // Display mode — map param bits to GPUSTAT:

@@ -1,6 +1,7 @@
 #include "Display.hpp"
-#include <cstdio>
+#include <algorithm>
 #include <array>
+#include <cstdio>
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 // The display window is 2× the native VRAM size for legibility.
@@ -94,7 +95,17 @@ void Display::present(const GPU& gpu) noexcept {
     }
 
     SDL_UnlockTexture(texture_);
+
+    // Crop to the GPU's configured active display area and scale to fill the window.
+    const auto dw = static_cast<int>(std::max(gpu.disp_width(),  1u));
+    const auto dh = static_cast<int>(std::max(gpu.disp_height(), 1u));
+    const SDL_Rect src {
+        static_cast<int>(gpu.disp_start_x()),
+        static_cast<int>(gpu.disp_start_y()),
+        dw, dh
+    };
+    SDL_RenderSetLogicalSize(renderer_, dw, dh);  // aspect-correct scaling
     SDL_RenderClear(renderer_);
-    SDL_RenderCopy(renderer_, texture_, nullptr, nullptr);
+    SDL_RenderCopy(renderer_, texture_, &src, nullptr);
     SDL_RenderPresent(renderer_);
 }
