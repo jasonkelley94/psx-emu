@@ -73,6 +73,10 @@ private:
     u8 cd_stat_ = 0x02u;  // default: motor on, disc present
     u8 mode_    = 0x20u;  // Setmode byte (0x20 = double-speed)
 
+    // ── XA-ADPCM filter (Setfilter 0x0D) ─────────────────────────────────────
+    u8 xa_file_    = 0u;
+    u8 xa_channel_ = 0u;
+
     // ── First response FIFO (up to 8 bytes) ───────────────────────────────────
     std::array<u8, 8> resp_{};
     u8            resp_len_     = 0;

@@ -617,6 +617,60 @@ void CDRom::handle_command(u8 cmd) noexcept {
         break;
     }
 
+    // ── 0x03 Play — CD-DA audio track playback (silent stub) ─────────────────
+    // Start playback from seek_lba_ (or current position).  On real hardware
+    // INT1 fires once per sector while playing; we fire INT3 + INT2 immediately
+    // so the BIOS/game sees a completed play command rather than hanging.
+    case 0x03:
+        sched1(3u, cd_stat_, kAck1);
+        sched2(2u, &cd_stat_, 1u, kD2Seek);
+        break;
+
+    // ── 0x04 Forward / 0x05 Backward — audio fast-scan (stub) ───────────────
+    case 0x04:
+    case 0x05:
+        sched1(3u, cd_stat_, kAck1);
+        break;
+
+    // ── 0x07 MotorOn — spin up motor ─────────────────────────────────────────
+    // Clears error flags and turns the motor on; INT3 then INT2.
+    case 0x07:
+        reading_ = false;
+        cd_stat_ = 0x02u;  // MOTOR_ON
+        sched1(3u, cd_stat_, kAck1);
+        sched2(2u, &cd_stat_, 1u, kD2Seek);
+        break;
+
+    // ── 0x0D Setfilter — XA-ADPCM file/channel filter ────────────────────────
+    // Store the target XA file and channel number.  No XA decode yet, but
+    // accepting the command prevents INT5 errors in games that set the filter
+    // before opening the XA stream.
+    case 0x0D:
+        xa_file_    = p0;
+        xa_channel_ = p1;
+        sched1(3u, cd_stat_, kAck1);
+        break;
+
+    // ── 0x19 Test — subcommand dispatch ──────────────────────────────────────
+    // Sub 0x20: return CDROM firmware version/date string.
+    case 0x19: {
+        if (p0 == 0x20u) {
+            // SCPH-1001 (NTSC-U) firmware date: 1997/01/10 version C2
+            const u8 r[4] = { 0x97u, 0x01u, 0x10u, 0xC2u };
+            sched(3u, r, 4u, kAck1);
+        } else {
+            const u8 err[2] = { static_cast<u8>(cd_stat_ | 0x01u), 0x40u };
+            sched(5u, err, 2u, kAck1);
+        }
+        break;
+    }
+
+    // ── 0x1C LockDoor / 0x1D UnlockDoor ──────────────────────────────────────
+    case 0x1C:
+    case 0x1D:
+        sched1(3u, cd_stat_, kAck1);
+        break;
+
     // ── Unknown command — INT5 error ──────────────────────────────────────────
     default: {
         std::fprintf(stderr, "[CDRom] unknown command 0x%02X\n",
