@@ -119,6 +119,32 @@ private:
 
     void joy_data_write(u8 b) noexcept;
 
+    // ── Memory card (SIO0 device 0x81) ────────────────────────────────────────
+    // Single-slot 128 KB (1024 frames × 128 B) PSX memory card.
+    // Addressed when the host sends 0x81 as the SIO0 device-select byte.
+    // Shares the joy_.rx_byte / joy_.rx_ready FIFO with the joypad (SIO0 bus).
+    //
+    // Supported commands:
+    //   0x52 Read Frame : seq 1–138, returns 128 bytes from mc_.ram at addr
+    //   0x57 Write Frame: seq 1–138, stores 128 bytes from host into mc_.ram
+    //   other           : ack sequence (FLAG + 0x5A + 0x5D) then idle
+    struct McState {
+        static constexpr u32 SIZE = 128u * 1024u;  // 1024 frames of 128 B
+        std::array<u8, SIZE> ram{};                 // card contents (heap via Bus)
+        u8  seq     = 0u;  // exchange position (1=cmd byte, 0=idle)
+        u8  cmd     = 0u;  // 0x52=read, 0x57=write
+        u8  addr_hi = 0u;
+        u8  addr_lo = 0u;
+        u8  cksum   = 0u;  // running XOR checksum
+    };
+    McState mc_{};
+    bool mc_active_ = false;  // true when 0x81 was last address byte seen
+
+    // Initialise mc_.ram to a properly formatted empty 1MB card.
+    void mc_format() noexcept;
+    // Advance the memory card exchange state machine.
+    void mc_data_write(u8 b) noexcept;
+
     // VBlank generation — fire IRQ0 every ~568,000 cycles (NTSC: 263 lines × ~2159 cycles).
     // 33.868 MHz CPU / ~59.94 Hz ≈ 565 K; empirically confirmed via psx-tests sys/8 timer
     // measuring ~71 K sys/8 ticks per frame (71 314 × 8 ≈ 570 K). 568 K fits measured data.

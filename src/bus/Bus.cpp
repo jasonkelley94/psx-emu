@@ -10,7 +10,9 @@ Bus::Bus(std::unique_ptr<Bios> bios)
     , timers_(std::make_unique<Timers>(*irq_, *gpu_))
       // DMA constructed last — it holds non-owning references to the above.
     , dma_   (std::make_unique<DMA>(*ram_, *gpu_, *irq_, *cdrom_))
-{}
+{
+    mc_format();  // pre-load an empty formatted memory card
+}
 
 // ── I/O window offsets (relative to IO_BASE = 0x1F80_1000) ───────────────────
 //
@@ -152,8 +154,11 @@ void Bus::io_write32(u32 phys, u32 value) noexcept {
     // ── Joypad / SIO0 (0x040–0x04F) ─────────────────────────────────────────
     if (off >= 0x040u && off < 0x060u) {
         if (off == 0x040u) joy_data_write(static_cast<u8>(value));  // JOY_DATA
-        if (off == 0x04Au) {  // JOY_CTRL: bit 6 (reset) or bit 4 (ack) resets seq
-            if (value & (1u << 6u)) { joy_.seq = 0u; joy_.rx_ready = false; }
+        if (off == 0x04Au) {  // JOY_CTRL: bit 6 (reset) clears both state machines
+            if (value & (1u << 6u)) {
+                joy_.seq = 0u; joy_.rx_ready = false;
+                mc_.seq = 0u; mc_active_ = false;
+            }
         }
         return;  // other SIO0/SIO1 writes silently ignored
     }
@@ -266,14 +271,29 @@ void Bus::io_write8(u32 phys, u8 value) noexcept {
                  off, static_cast<u32>(value));
 }
 
-// ── SIO0 joypad exchange state machine ───────────────────────────────────────
-// Called each time the host writes a byte to JOY_DATA (0x1F801040).
-// Advances the per-transaction sequence and prepares the response byte.
+// ── SIO0 exchange state machine ───────────────────────────────────────────────
+// joy_data_write() is the single entry point for every byte written to
+// JOY_DATA.  The address byte (seq==0) selects the device:
+//   0x01 → joypad (digital pad)
+//   0x81 → memory card
+// Subsequent bytes are routed to the appropriate sub-machine.
 void Bus::joy_data_write(u8 b) noexcept {
+    // ── Memory card in progress — route to its state machine ─────────────────
+    if (mc_active_) {
+        mc_data_write(b);
+        return;
+    }
+
     switch (joy_.seq) {
-    case 0:  // Address byte — only advance if host is addressing pad 1 (0x01)
-        joy_.rx_byte = 0xFF;
-        joy_.seq     = (b == 0x01u) ? 1u : 0u;
+    case 0:  // Address byte — select device
+        joy_.rx_byte = 0xFFu;
+        if (b == 0x01u) {
+            joy_.seq = 1u;          // joypad selected
+        } else if (b == 0x81u) {
+            mc_active_ = true;      // memory card selected
+            mc_.seq    = 1u;        // mc_data_write() starts at seq 1 (command)
+        }
+        // Unknown address: stay idle, return 0xFF
         break;
     case 1:  // Command byte: 0x42 = poll → respond with digital-pad ID (0x41)
         joy_.rx_byte = (b == 0x42u) ? 0x41u : 0xFFu;
@@ -292,15 +312,145 @@ void Bus::joy_data_write(u8 b) noexcept {
         joy_.seq     = 0u;
         break;
     default:
-        joy_.rx_byte = 0xFF;
+        joy_.rx_byte = 0xFFu;
         joy_.seq     = 0u;
         break;
     }
     joy_.rx_ready = true;
     // Fire IRQ7 (Controller) to emulate the /ACK pulse driven by the real pad.
-    // Interrupt-driven SIO0 code (PSN00BSDK PadInit) waits for IRQ7 before
-    // reading JOY_DATA, so without this the pad ISR never executes.
     irq_->set(IRQSource::Ctrl);
+}
+
+// ── Memory card exchange state machine ────────────────────────────────────────
+// Read frame (0x52):
+//   seq 1: cmd→FLAG  2:→5Ah  3:→5Dh  4:addr_hi→0  5:addr_lo→0
+//   seq 6:→addr_hi   7:→addr_lo  8:→5Ch  9..136:→data[0..127]
+//   seq 137:→cksum   138:→47h  → idle
+// Write frame (0x57):
+//   seq 1..7: same header as read
+//   seq 8..135: data[0..127]←host  136: cksum←host  137:→5Ch  138:→47h  → idle
+// Other commands: FLAG + 5Ah + 5Dh + a few 0x00 bytes then idle.
+void Bus::mc_data_write(u8 b) noexcept {
+    const u32 frame = (static_cast<u32>(mc_.addr_hi) << 8u) | mc_.addr_lo;
+    const u32 base  = frame * 128u;
+
+    switch (mc_.seq) {
+    case 1:  // command byte
+        mc_.cmd      = b;
+        joy_.rx_byte = 0x00u;   // FLAG = 0x00: normal (no error, card initialized)
+        mc_.seq++;
+        break;
+    case 2:  // → 0x5A  (ACK byte 1)
+        joy_.rx_byte = 0x5Au;
+        mc_.seq++;
+        break;
+    case 3:  // → 0x5D  (ACK byte 2)
+        joy_.rx_byte = 0x5Du;
+        mc_.seq++;
+        break;
+    case 4:  // frame address MSB
+        mc_.addr_hi  = b;
+        joy_.rx_byte = 0x00u;
+        mc_.seq++;
+        break;
+    case 5:  // frame address LSB → validate and start checksum
+        mc_.addr_lo  = b;
+        mc_.cksum    = mc_.addr_hi ^ mc_.addr_lo;
+        joy_.rx_byte = 0x00u;
+        mc_.seq++;
+        break;
+    case 6:  // echo addr_hi
+        joy_.rx_byte = mc_.addr_hi;
+        mc_.seq++;
+        break;
+    case 7:  // echo addr_lo
+        joy_.rx_byte = mc_.addr_lo;
+        mc_.seq++;
+        break;
+
+    default:
+        if (mc_.cmd == 0x52u) {
+            // ── READ FRAME ────────────────────────────────────────────────────
+            if (mc_.seq == 8u) {
+                // Confirm address validity (5Ch = good, 04h = bad)
+                joy_.rx_byte = (frame < 1024u) ? 0x5Cu : 0x04u;
+                mc_.seq++;
+            } else if (mc_.seq <= 136u) {
+                // Data bytes 0..127 (seq 9..136)
+                const u32 di  = mc_.seq - 9u;
+                const u8  val = (base + di < McState::SIZE) ? mc_.ram[base + di] : 0x00u;
+                mc_.cksum   ^= val;
+                joy_.rx_byte = val;
+                mc_.seq++;
+            } else if (mc_.seq == 137u) {
+                joy_.rx_byte = mc_.cksum;   // XOR checksum
+                mc_.seq++;
+            } else {
+                joy_.rx_byte = 0x47u;       // 'G' = Good
+                mc_.seq     = 0u;
+                mc_active_  = false;
+            }
+        } else if (mc_.cmd == 0x57u) {
+            // ── WRITE FRAME ───────────────────────────────────────────────────
+            if (mc_.seq <= 135u) {
+                // Data bytes 0..127 (seq 8..135)
+                const u32 di = mc_.seq - 8u;
+                if (base + di < McState::SIZE) {
+                    mc_.ram[base + di] = b;
+                    mc_.cksum         ^= b;
+                }
+                joy_.rx_byte = 0x00u;
+                mc_.seq++;
+            } else if (mc_.seq == 136u) {
+                // Receive checksum from host (acknowledge, don't validate)
+                joy_.rx_byte = 0x00u;
+                mc_.seq++;
+            } else if (mc_.seq == 137u) {
+                joy_.rx_byte = 0x5Cu;   // confirm write OK
+                mc_.seq++;
+            } else {
+                joy_.rx_byte = 0x47u;   // 'G' = Good
+                mc_.seq     = 0u;
+                mc_active_  = false;
+            }
+        } else {
+            // ── Unknown command — short ack then idle ─────────────────────────
+            joy_.rx_byte = 0x00u;
+            if (mc_.seq >= 10u) {
+                mc_.seq    = 0u;
+                mc_active_ = false;
+            } else {
+                mc_.seq++;
+            }
+        }
+        break;
+    }
+
+    joy_.rx_ready = true;
+    irq_->set(IRQSource::Ctrl);
+}
+
+// ── Format the memory card with an empty PSX directory ────────────────────────
+// Frame 0  : Manufacturer's block — magic "MC" + XOR checksum.
+// Frames 1–15: Free directory entries (status=0xA0, next=0xFFFF, checksum=0xA0).
+// All other frames are zero (available for data).
+void Bus::mc_format() noexcept {
+    mc_.ram.fill(0x00u);
+
+    // Frame 0: Manufacturer's block "MC"
+    mc_.ram[0]   = 0x4Du;  // 'M'
+    mc_.ram[1]   = 0x43u;  // 'C'
+    mc_.ram[127] = 0x4Du ^ 0x43u;  // XOR checksum of bytes 0–126 = 0x0E
+
+    // Frames 1–15: Free directory entries
+    for (u32 f = 1u; f <= 15u; ++f) {
+        const u32 b = f * 128u;
+        mc_.ram[b + 0]   = 0xA0u;  // block status: free
+        mc_.ram[b + 8]   = 0xFFu;  // next block pointer hi: none
+        mc_.ram[b + 9]   = 0xFFu;  // next block pointer lo: none
+        // XOR of bytes 0–126: 0xA0 ^ 0xFF ^ 0xFF = 0xA0
+        mc_.ram[b + 127] = 0xA0u;
+    }
 }
 
 // ── TTY putchar ───────────────────────────────────────────────────────────────
