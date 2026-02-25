@@ -2,22 +2,26 @@
 
 ## Test Results Summary
 
+Tests marked **AUTO** are covered by `tests/run_tests.sh` and run automatically in CI.
+
 | Test | Status | Notes |
 |------|--------|-------|
-| `gte/test-all` | **1150/1150 ✓** | |
-| `dma/otc-test` | **15/15 ✓** | |
-| `gpu/gp0-e1` | **9/9 ✓** | |
-| `gpu/mask-bit` | **5/5 ✓** | |
-| `cpu/cop` | **2/2 ✓** | |
-| `cpu/code-in-io` | **3/3 ✓** | IBE exception + A(0x40) BIOS intercept fixed |
-| `timers/timers` | **Passes ✓** | All checks pass; "Done." printed within 20M cycles |
-| `dma/chopping` | **Passes ✓** | Burst interleaving with CPU cycle credits |
-| `dma/chain-looping` | **Passes ✓** | Chain-end sentinel + DMA IRQ fire correct |
+| `gte/test-all` | **1150/1150 ✓** AUTO | |
+| `dma/otc-test` | **13/13 ✓** AUTO | |
+| `dma/chopping` | **Passes ✓** AUTO | Burst interleaving with CPU cycle credits |
+| `dma/chain-looping` | **Passes ✓** AUTO | Chain-end sentinel + DMA IRQ fire correct |
+| `gpu/gp0-e1` | **10/10 ✓** AUTO | |
+| `gpu/mask-bit` | **5/5 ✓** AUTO | |
 | `gpu/transparency` | **Passes ✓** | All 4 semi-transparency blend modes |
-| `cdrom/getloc` | **Passes ✓** | Fixed: kSect1_1x increased to 5M cycles |
+| `cpu/cop` | **Passes ✓** AUTO | |
+| `cpu/code-in-io` | **Passes ✓** AUTO | IBE exception + A(0x40) BIOS intercept fixed |
+| `cpu/io-access-bitwidth` | **Passes ✓** AUTO | |
+| `timers/timers` | **Passes ✓** AUTO | Done. printed ~35–40M cycles in |
+| `cdrom/getloc` | **Passes ✓** AUTO | kSect1_1x = 5M cycles |
 | `cdrom/timing` | **Completes ✓** | Reports timing measurements; no pass/fail verdict |
 | `cdrom/disc-swap` | **N/A** | Requires physical tray open; not runnable headless |
 | `cdrom/terminal` | **N/A** | Interactive UART tool; not runnable headless |
+| `input/pad` | **Passes ✓** | All 16 buttons recognised |
 | `spu/test` | **Runs ✓** | Completes "16/32-bit access" and "crashing now..." (~100M cycles) |
 | `spu/memory-transfer` | **Runs ✓** | Completes within 20M cycles; no explicit pass/fail output |
 | `spu/stereo` | **Runs ✓** | Completes within 20M cycles (visual/audio test) |
@@ -25,152 +29,142 @@
 | `spu/toolbox` | **N/A** | Interactive controller test; not headless testable |
 | `dma/dpcr` | **Pending** | Needs SPU DMA ch4 (deferred to SPU phase) |
 
----
-
-## Recent Fixes (this session)
-
-### cdrom/getloc — First Sector Timing (FIXED)
-
-**Root cause:** `kSect1_1x = 950,000` caused INT1 (first sector) to fire at ~985K cycles
-from ReadN dispatch — during the test's ~4M cycle busy-wait delay loop. The psxcd IRQ
-handler responded to INT1 by issuing Pause, which reset `cd_stat_` to 0x02. When the
-delay loop finished and the test called GetStat, it got 0x02 instead of 0x42 (SEEKING).
-
-On real PSX hardware, the first sector after ReadN takes 80–150ms to arrive. At
-500 RPM (inner track of a CLV disc), one full rotation is ~4M CPU cycles (33.868 MHz /
-8.33 rotations/sec ≈ 4,064,000 cycles). The test's delay loop was calibrated for this.
-
-**Fix in `src/cdrom/CDRom.cpp`:**
-- `kSect1_1x`: 950,000 → **5,000,000** (~148ms, safely past the test's 4M-cycle loop)
-- `kSect1_2x`: 520,000 → **3,000,000** (proportional for 2× speed)
-- All debug traces and `g_total_cycles` global removed
-
-**Result:** `cdrom/getloc` → **"Test passed"**
+Run the full automated suite:
+```bash
+PSX_EMU=/tmp/psx-emu PS1_TESTS_DIR=/tmp/ps1-tests-full bash tests/run_tests.sh
+# or after cmake build + tests/fetch_tests.sh:
+bash tests/run_tests.sh
+```
 
 ---
 
-### CDROM: Additional debug cleanup
+## Recent Fixes
 
-Removed all temporary debug `fprintf` traces added during investigation:
-- `push_response_n`: removed `[CDRom@Kk] push_resp INT...`
-- `handle_command`: removed `[CDRom@Kk] cmd=...`
-- `read()` case 1/3: removed R1 and R3 register traces
-- `tick()` s2_ path: removed s2-fired trace
-- `main.cpp`: removed PC-trace window (1700K–1720K range)
-- Removed `#include <cstdint>` and `static uint64_t g_total_cycles = 0`
+### Test Automation — ps1-tests runner + GitHub Actions CI
 
----
-
-### SPU Tests — Current Status
-
-Running all 5 SPU tests headless:
-
-| Test | Outcome | Notes |
-|------|---------|-------|
-| `spu/test` | Completes | "16 bit access Done / 32 bit access Done / crashing now..." — ~100M cycles needed |
-| `spu/memory-transfer` | Completes | No pass/fail text; finishes within 20M cycles |
-| `spu/stereo` | Completes | Visual/audio test; VRAM dump produced |
-| `spu/ram-sandbox` | N/A | Interactive (controller-driven) |
-| `spu/toolbox` | N/A | Interactive (controller-driven) |
-
-The SPU register file passthrough (`spu_regs_[]`) is sufficient for the automated tests to run
-and exit. DMA channel 4 stubs out (immediately completes) — sufficient for the tests that
-complete, but `dma/dpcr` still needs real ch4 transfer semantics.
-
-`spu/test` prints "crashing now..." intentionally — it tests exception behavior by jumping
-to an invalid address after the register access tests finish.
+Added `tests/run_tests.sh`, `tests/fetch_tests.sh`, and `.github/workflows/ci.yml`.
+The runner covers 11 automatable tests with TTY-based pass/fail detection.
+`tests/fetch_tests.sh` downloads the JaCzekanski/ps1-tests release zip into
+`tests/ps1-tests/` (gitignored).  CI runs on every push and PR.
 
 ---
 
-### Timer Timing Constants (FIXED — prior session)
+### GPU Display Area — GP1(05) and GP1(07) Implemented
 
-`timers/timers` dotclock and sys/8 results were wrong; VBlank fired 5.7× too fast.
+**Root cause:** The SDL window always showed raw 1024×512 VRAM from (0,0), ignoring the
+game's configured display region.  GP1(05) (display start X/Y) and GP1(07) (vertical
+display range) were stubs that did nothing.
 
-**Fixes in `src/bus/Bus.hpp` and `src/timers/Timers.cpp`:**
-- `kVBlankPeriod`: 100,000 → 568,000 cycles (NTSC: ~263 lines × ~2159 cycles)
-- `kVBlankDuration`: 10/263 → 23/263 of period (correct VBlank pulse width)
-- Dotclock formula: `cycles / div` → `cycles * 11 / (div * 7)` (PSX pixel clock = sys × 11/7)
-
----
-
-### DMA Chopping Mode (FIXED — prior session)
-
-**Fix in `src/dma/DMA.cpp`:**
-- CHCR bits [19:16] = chop_dma_window (words per burst), [22:20] = chop_cpu_window.
-- Added `chop_credits_` counter to accumulate CPU-cycle debt between bursts.
-- `DMA::tick()` drains at most one burst worth of words per call, then credits
-  `chop_cpu_window << chop_dma_window` cycles back to the CPU counter.
+**Fix across three files:**
+- `src/gpu/GPU.hpp`: added `disp_x_`, `disp_y_`, `disp_v1_` (= 16), `disp_v2_` (= 256)
+  private fields; added `disp_start_x()`, `disp_start_y()`, `disp_width()`,
+  `disp_height()` public accessors.
+- `src/gpu/GPU.cpp`: `GP1(05)` stores display-start X/Y; `GP1(07)` stores vert range.
+- `src/display/Display.cpp`: `present()` now uses a source `SDL_Rect` cropped to the
+  GPU's active display area and calls `SDL_RenderSetLogicalSize()` for aspect-correct
+  scaling.  A 320×240 game at VRAM (0,16) now fills the window instead of appearing as
+  a tiny patch in the upper-left corner.
 
 ---
 
-### DMA Chain-End Detection (FIXED — prior session)
+### CDROM — XA-ADPCM Sector Detection and Decode
 
-**Fix in `src/dma/DMA.cpp` (CH2 LL path):**
-- On sentinel detection: clear CHCR bit 24 (transfer complete), call
-  `irq_.set(IRQSource::DMA2)`, break the transfer loop.
+Mode-2 raw sectors with sub-header submode bit 2 set are now decoded as XA-ADPCM rather
+than copied into the data buffer.  The ADPBUSY flag (`cd_stat_` bit 2) is set during XA
+decode and cleared on data sectors or Pause.  Prevents hangs in games that check ADPBUSY
+in their INT1 handler.
+
+Key details:
+- Sub-header read at `sector_start + 16` to check file/channel/submode/coding.
+- Setfilter (cmd 0x0D) gating via `xa_file_` / `xa_channel_` when mode_ bit 3 is set.
+- 4-bit ADPCM decoder: 18 × 128-byte sound groups per sector, Q6 fixed-point IIR filter
+  with 4 coefficient pairs.  PCM output held in a 4096-pair ring buffer for SDL output.
 
 ---
 
-### GPU Semi-Transparency Blend Modes (FIXED — prior session)
+### CDROM — Additional Command Handlers
 
-**Fix in `src/gpu/GPU.cpp` (`put_pixel()`):**
-- All 4 PSX blend modes implemented (GP0-E1 bits [6:5]):
-  - 0: `(src + dst) / 2`
-  - 1: `src + dst`  (clamped to 31 per channel)
-  - 2: `src - dst`  (clamped to 0)
-  - 3: `src + dst/4`
+Added handlers for commands that were previously returning INT5 errors:
+- `0x03` Play (audio track playback, fires INT3)
+- `0x04` / `0x05` Forward / Backward skip
+- `0x07` MotorOn (sets MOTOR_ON, fires INT3 + INT2)
+- `0x0D` Setfilter (stores XA file/channel filter for mode_ bit 3 gating)
+- `0x19` Test (sub-command 0x20 returns BIOS version bytes)
+- `0x1C` / `0x1D` LockDoor / UnlockDoor (no-op acknowledge)
+
+---
+
+### Interactive SDL Window — sideloaded EXEs
+
+Removed the unconditional `headless = true` for `.exe` sideload mode in `src/main.cpp`.
+Running `./psx_emu test.exe` now opens an SDL window; `--headless` still works as before.
+
+---
+
+### cdrom/getloc — First Sector Timing (prior session)
+
+`kSect1_1x`: 950,000 → 5,000,000 cycles (~148ms, past the test's 4M-cycle busy-wait).
+`kSect1_2x`: 520,000 → 3,000,000 cycles.
+**Result:** `cdrom/getloc` → "Test passed"
+
+---
+
+### Timer Timing Constants (prior session)
+
+`kVBlankPeriod`: 100,000 → 568,000 cycles (NTSC: ~263 lines × ~2159 cycles).
+Dotclock: `cycles / div` → `cycles * 11 / (div * 7)` (PSX pixel clock = sys × 11/7).
 
 ---
 
 ## Known Issues / Next Work
 
 ### 1. dma/dpcr — needs SPU DMA ch4
-The dpcr test exercises DMA channel 4 (SPU). Currently stubbed to no-op (immediately
-completes, transfers no data). Will be addressed when SPU RAM is implemented.
+DMA channel 4 (SPU) is stubbed to no-op.  Will be addressed when SPU RAM is implemented.
 
 ### 2. SPU — Minimal Stub Only
-24-voice synthesis, ADSR, pitch, reverb not implemented. The `spu_regs_[]` register
-file passthrough is sufficient for the automated tests. DMA channel 4 silently completes
-without transferring data.
+24-voice synthesis, ADSR, pitch, reverb not implemented.  Register file passthrough
+(`spu_regs_[0x280]`) is sufficient for the automated tests.
 
-Remaining SPU work needed for full test coverage:
+Remaining work for full coverage:
 - SPU RAM buffer (512 KB at 0x1F801DA6/0x1F801DA8 transfer interface)
-- DMA ch4 actual data transfer (to/from SPU RAM ↔ main RAM)
-- SPUSTAT[5:0] to mirror SPUCNT[5:0] (currently a passthrough; reads from different offset)
+- DMA ch4 actual data transfer (SPU RAM ↔ main RAM)
+- SPUSTAT[5:0] mirroring SPUCNT[5:0]
 
-### 3. GPU Visual Tests — Not Compared
+### 3. GPU Visual Tests — Not Pixel-Compared
 15 GPU visual tests (`triangle`, `quad`, `rectangles`, `lines`, etc.) produce VRAM dumps
-but have not been pixel-compared against reference PNGs yet.
+but have not been compared against reference PNGs.
 
 ### 4. MDEC — Not Implemented
-Hardware JPEG-like decoder. Needed for 9 MDEC tests.
-
-### 5. Joypad (input/pad)
-SIO0 digital pad stub is in place (all buttons released response). The `input/pad` test
-has not been run yet.
+Hardware JPEG-like decoder.  Needed for 9 MDEC tests.
 
 ---
 
 ## Architecture Notes
 
-### CPU (`src/cpu/CPU.cpp`, `src/cpu/CPU.hpp`)
+### CPU (`src/cpu/CPU.cpp`)
 - MIPS R3000A, no cache, load delay slot modelled via `PendingLoad`
 - Exceptions via `exception(ExceptionCode, ce=0)` — uses `current_epc_` / `current_bd_`
 - BIOS intercepts at `0x000000A0` (A-table) and `0x000000B0` (B-table)
 - GTE (COP2) delegated to `src/gte/GTE.cpp`
 - SYSCALL handler: `a0=1` → EnterCS (clear IEc), `a0=2` → ExitCS (set IEc+IM[2]), `epc+=4`
 
-### GPU (`src/gpu/GPU.cpp`)
+### GPU (`src/gpu/GPU.cpp`, `src/gpu/GPU.hpp`)
 - Software rasteriser: triangles, quads, lines, rectangles
 - VRAM: 1024×512 16bpp
 - Semi-transparency: all 4 blend modes (GP0-E1 bits [6:5])
+- Display area: GP1(05) sets display start X/Y; GP1(07) sets vertical range
 - VBlank every `kVBlankPeriod = 568,000` cycles (NTSC accurate)
+
+### Display (`src/display/Display.cpp`)
+- SDL2 streaming texture (1024×512 ARGB8888)
+- `present()` crops to GPU active display area using a source `SDL_Rect`
+- `SDL_RenderSetLogicalSize` maintains aspect ratio on window resize
 
 ### Timers (`src/timers/Timers.cpp`)
 - Three 16-bit counters; sys / dot / HBlank-count / sys/8 clock sources
 - All sync modes for T0 (HBlank gate) and T1 (VBlank gate) implemented
 - T2 sync modes 0/3 stop permanently; 1/2 free-run
-- Dotclock: sys × 11 / (dot_divisor × 7); sys/8: one tick per 8 CPU cycles
+- Dotclock divisor from `GPU::dot_divisor()` (GPUSTAT[18:16])
 
 ### DMA (`src/dma/DMA.cpp`)
 - OTC (ch6) ✓, GPU LL (ch2) ✓, GPU VRAM (ch2 sync=2) ✓
@@ -180,20 +174,17 @@ has not been run yet.
 
 ### CDROM (`src/cdrom/CDRom.cpp`)
 - Commands: GetStat, Setloc, ReadN/S, Stop, Pause, Init, Mute/Demute, Setmode,
-  Getparam, GetTN, GetTD, SeekL/P, GetlocL, GetlocP, GetID
-- Timing constants: kAck1=50K, kAck1Read=35K, kSect1_1x=5M, kSectN_1x=448K cycles
-- Signed LBA (`int32_t`) supports lead-in/pregap seeks (negative LBA)
-- `loc_valid_`: set after first seek/read; not reset by Init (soft reset)
-- `pos_valid_`: tracks Q-subchannel validity; false only after out-of-range seek
-- `irq_en_` gating: CDROM only asserts CPU IRQ when INT type is enabled (bit-correct)
+  Getparam, GetTN, GetTD, SeekL/P, GetlocL, GetlocP, GetID, Play, MotorOn,
+  Setfilter, Test, LockDoor/UnlockDoor
+- XA-ADPCM decode: sub-header detection, 4-bit IIR filter, PCM ring buffer
+- Timing: kAck1=50K, kAck1Read=35K, kSect1_1x=5M, kSectN_1x=448K cycles
 
 ### SPU (`src/bus/Bus.cpp`)
 - Register file passthrough via `spu_regs_[0x280]` covering 0x1F801C00–0x1F801E7F
-- 16-bit, 32-bit, 8-bit R/W all backed by the array
 - No actual synthesis, no SPU RAM, no DMA data transfer
+
+### Joypad (`src/bus/Bus.cpp`)
+- SIO0 digital pad fully implemented (all 16 buttons); IRQ on each byte exchange
 
 ### MDEC
 - Not implemented
-
-### Joypad (SIO0)
-- Digital pad fully implemented (all 16 buttons); IRQ on each byte exchange
