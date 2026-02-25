@@ -119,18 +119,20 @@ private:
 
     void joy_data_write(u8 b) noexcept;
 
-    // VBlank generation — fire IRQ0 every ~100,000 cycles.
-    static constexpr u32 kVBlankPeriod    = 100'000u;
-    // VBlank active duration: ~5% of frame (~10 scanlines of the 263 total).
-    static constexpr u32 kVBlankDuration  = kVBlankPeriod * 10u / 263u;  // ~3802
+    // VBlank generation — fire IRQ0 every ~568,000 cycles (NTSC: 263 lines × ~2159 cycles).
+    // 33.868 MHz CPU / ~59.94 Hz ≈ 565 K; empirically confirmed via psx-tests sys/8 timer
+    // measuring ~71 K sys/8 ticks per frame (71 314 × 8 ≈ 570 K). 568 K fits measured data.
+    static constexpr u32 kVBlankPeriod    = 568'000u;
+    // VBlank active duration: 23 blank lines out of 263 total (~8.7% of frame).
+    static constexpr u32 kVBlankDuration  = kVBlankPeriod * 23u / 263u;  // ~49 660 cycles
     u32 vblank_cycles_  = 0;
     u32 vblank_active_  = 0;   // cycles since VBlank start; 0 = outside VBlank
     bool in_vblank_     = false;
 
-    // HBlank generation — one pulse per scanline (263 per NTSC frame, ≈380 cycles).
-    static constexpr u32 kHBlankPeriod   = kVBlankPeriod / 263u;  // ≈380 cycles
+    // HBlank generation — one pulse per scanline (263 per NTSC frame, ≈2159 cycles).
+    static constexpr u32 kHBlankPeriod   = kVBlankPeriod / 263u;  // ≈2159 cycles
     // HBlank active duration: ~18% of scanline.
-    static constexpr u32 kHBlankDuration = kHBlankPeriod * 18u / 100u;  // ≈68 cycles
+    static constexpr u32 kHBlankDuration = kHBlankPeriod * 18u / 100u;  // ≈389 cycles
     u32 hblank_cycles_  = 0;
     u32 hblank_active_  = 0;   // cycles since HBlank start; 0 = outside HBlank
     bool in_hblank_     = false;

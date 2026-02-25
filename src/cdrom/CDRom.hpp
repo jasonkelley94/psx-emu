@@ -103,7 +103,13 @@ private:
     // ── Disc image ─────────────────────────────────────────────────────────────
     std::FILE* disc_     = nullptr;
     bool       disc_bin_ = false;    // true = 2352 B/sector BIN; false = ISO 2048
-    u32        seek_lba_ = 0;        // target LBA saved by Setloc
+    int32_t    seek_lba_ = 0;        // target LBA saved by Setloc (signed: negative = lead-in)
+
+    // ── Head position tracking (for GetlocL / GetlocP) ─────────────────────────
+    int32_t loc_lba_   = 0;      // signed LBA of last-read/seeked sector (GetlocL)
+    bool    loc_valid_ = false;  // loc_lba_ is valid (a seek/read has occurred)
+    bool    pos_valid_ = true;   // Q-subchannel position valid (false only after OOB seek)
+    int32_t pos_lba_   = -7;     // current head position: ≥0 = track data, <0 = pregap
 
     // ── Sector data buffer (for DMA ch3 readback) ─────────────────────────────
     static constexpr u32 SECTOR_SIZE = 2048u;
@@ -136,9 +142,11 @@ private:
         return static_cast<u32>(v >> 4u) * 10u + static_cast<u32>(v & 0xFu);
     }
 
-    // Convert MSF (three BCD bytes) to a disc LBA.
-    // LBA 0 = MSF 00:02:00 (first user-data sector, 150 frames after the lead-in).
-    static u32 msf_to_lba(u8 m, u8 s, u8 f) noexcept {
-        return (from_bcd(m) * 60u + from_bcd(s)) * 75u + from_bcd(f) - 150u;
+    // Convert MSF (three BCD bytes) to a disc LBA (signed).
+    // LBA 0 = absolute MSF 00:02:00 (first user-data sector, 150 frames into disc).
+    // Negative LBA means the position is in the lead-in / pregap (before track data).
+    static int32_t msf_to_lba(u8 m, u8 s, u8 f) noexcept {
+        return static_cast<int32_t>(
+            (from_bcd(m) * 60u + from_bcd(s)) * 75u + from_bcd(f)) - 150;
     }
 };

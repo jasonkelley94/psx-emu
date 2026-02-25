@@ -92,12 +92,14 @@ void Timers::tick(u32 cycles) noexcept {
 
         if (run) {
             if ((t.mode >> 8u) & 1u) {
-                // Dotclock source: one dot per (sys / divisor) system cycles.
-                // Divisor is read from the GPU's current horizontal resolution.
+                // Dotclock source: PSX GPU dotclock = sys × 11/7 / dot_divisor.
+                // The GPU pixel clock runs at 53.22 MHz (sys × 11/7); dot_divisor
+                // maps the horizontal resolution to a pixel period in dot cycles.
+                // We accumulate in units of (sys × 11) and divide by (div × 7).
                 const u32 div = gpu_.dot_divisor();
-                dot_frac_ += cycles;
-                const u32 ticks = dot_frac_ / div;
-                dot_frac_ %= div;
+                dot_frac_ += cycles * 11u;
+                const u32 ticks = dot_frac_ / (div * 7u);
+                dot_frac_ %= (div * 7u);
                 advance(0, ticks);
             } else {
                 advance(0, cycles);

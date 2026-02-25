@@ -14,44 +14,106 @@
 | `dma/chopping` | **Passes ✓** | Burst interleaving with CPU cycle credits |
 | `dma/chain-looping` | **Passes ✓** | Chain-end sentinel + DMA IRQ fire correct |
 | `gpu/transparency` | **Passes ✓** | All 4 semi-transparency blend modes |
-| `cdrom/timing` | **Stuck ❌** | psxcd init hangs; see CDROM section below |
+| `cdrom/getloc` | **Passes ✓** | Fixed: kSect1_1x increased to 5M cycles |
+| `cdrom/timing` | **Completes ✓** | Reports timing measurements; no pass/fail verdict |
+| `cdrom/disc-swap` | **N/A** | Requires physical tray open; not runnable headless |
+| `cdrom/terminal` | **N/A** | Interactive UART tool; not runnable headless |
+| `spu/test` | **Runs ✓** | Completes "16/32-bit access" and "crashing now..." (~100M cycles) |
+| `spu/memory-transfer` | **Runs ✓** | Completes within 20M cycles; no explicit pass/fail output |
+| `spu/stereo` | **Runs ✓** | Completes within 20M cycles (visual/audio test) |
+| `spu/ram-sandbox` | **N/A** | Interactive controller test; not headless testable |
+| `spu/toolbox` | **N/A** | Interactive controller test; not headless testable |
+| `dma/dpcr` | **Pending** | Needs SPU DMA ch4 (deferred to SPU phase) |
 
 ---
 
 ## Recent Fixes (this session)
 
-### DMA Chopping Mode (Task E — FIXED)
-`dma/chopping.exe` reported 25 cycles regardless of block size.
+### cdrom/getloc — First Sector Timing (FIXED)
 
-**Root cause:** The entire transfer ran in one shot — CPU got zero cycles during DMA.
+**Root cause:** `kSect1_1x = 950,000` caused INT1 (first sector) to fire at ~985K cycles
+from ReadN dispatch — during the test's ~4M cycle busy-wait delay loop. The psxcd IRQ
+handler responded to INT1 by issuing Pause, which reset `cd_stat_` to 0x02. When the
+delay loop finished and the test called GetStat, it got 0x02 instead of 0x42 (SEEKING).
+
+On real PSX hardware, the first sector after ReadN takes 80–150ms to arrive. At
+500 RPM (inner track of a CLV disc), one full rotation is ~4M CPU cycles (33.868 MHz /
+8.33 rotations/sec ≈ 4,064,000 cycles). The test's delay loop was calibrated for this.
+
+**Fix in `src/cdrom/CDRom.cpp`:**
+- `kSect1_1x`: 950,000 → **5,000,000** (~148ms, safely past the test's 4M-cycle loop)
+- `kSect1_2x`: 520,000 → **3,000,000** (proportional for 2× speed)
+- All debug traces and `g_total_cycles` global removed
+
+**Result:** `cdrom/getloc` → **"Test passed"**
+
+---
+
+### CDROM: Additional debug cleanup
+
+Removed all temporary debug `fprintf` traces added during investigation:
+- `push_response_n`: removed `[CDRom@Kk] push_resp INT...`
+- `handle_command`: removed `[CDRom@Kk] cmd=...`
+- `read()` case 1/3: removed R1 and R3 register traces
+- `tick()` s2_ path: removed s2-fired trace
+- `main.cpp`: removed PC-trace window (1700K–1720K range)
+- Removed `#include <cstdint>` and `static uint64_t g_total_cycles = 0`
+
+---
+
+### SPU Tests — Current Status
+
+Running all 5 SPU tests headless:
+
+| Test | Outcome | Notes |
+|------|---------|-------|
+| `spu/test` | Completes | "16 bit access Done / 32 bit access Done / crashing now..." — ~100M cycles needed |
+| `spu/memory-transfer` | Completes | No pass/fail text; finishes within 20M cycles |
+| `spu/stereo` | Completes | Visual/audio test; VRAM dump produced |
+| `spu/ram-sandbox` | N/A | Interactive (controller-driven) |
+| `spu/toolbox` | N/A | Interactive (controller-driven) |
+
+The SPU register file passthrough (`spu_regs_[]`) is sufficient for the automated tests to run
+and exit. DMA channel 4 stubs out (immediately completes) — sufficient for the tests that
+complete, but `dma/dpcr` still needs real ch4 transfer semantics.
+
+`spu/test` prints "crashing now..." intentionally — it tests exception behavior by jumping
+to an invalid address after the register access tests finish.
+
+---
+
+### Timer Timing Constants (FIXED — prior session)
+
+`timers/timers` dotclock and sys/8 results were wrong; VBlank fired 5.7× too fast.
+
+**Fixes in `src/bus/Bus.hpp` and `src/timers/Timers.cpp`:**
+- `kVBlankPeriod`: 100,000 → 568,000 cycles (NTSC: ~263 lines × ~2159 cycles)
+- `kVBlankDuration`: 10/263 → 23/263 of period (correct VBlank pulse width)
+- Dotclock formula: `cycles / div` → `cycles * 11 / (div * 7)` (PSX pixel clock = sys × 11/7)
+
+---
+
+### DMA Chopping Mode (FIXED — prior session)
 
 **Fix in `src/dma/DMA.cpp`:**
 - CHCR bits [19:16] = chop_dma_window (words per burst), [22:20] = chop_cpu_window.
 - Added `chop_credits_` counter to accumulate CPU-cycle debt between bursts.
 - `DMA::tick()` drains at most one burst worth of words per call, then credits
   `chop_cpu_window << chop_dma_window` cycles back to the CPU counter.
-- Verified: timing now scales linearly with block size.
 
 ---
 
-### DMA Chain-End Detection (Task B — FIXED)
-`dma/chain-looping.exe` showed `finished=false, irq=false` for both test cases.
-
-**Root cause:** CH2 linked-list handler didn't fire the DMA2 IRQ or clear the busy
-bit when it read the `0x00FFFFFF` end-of-list sentinel.
+### DMA Chain-End Detection (FIXED — prior session)
 
 **Fix in `src/dma/DMA.cpp` (CH2 LL path):**
-- On sentinel detection: set CHCR bit 24 cleared (transfer complete), call
+- On sentinel detection: clear CHCR bit 24 (transfer complete), call
   `irq_.set(IRQSource::DMA2)`, break the transfer loop.
 
 ---
 
-### GPU Semi-Transparency Blend Modes (Task C — FIXED)
-`gpu/transparency.exe` produced incorrect blended output.
+### GPU Semi-Transparency Blend Modes (FIXED — prior session)
 
 **Fix in `src/gpu/GPU.cpp` (`put_pixel()`):**
-- Reads existing VRAM pixel and applies blend when primitive has semi-transparency
-  enabled (opcode bit) and the texel is not the colour-key (0x0000).
 - All 4 PSX blend modes implemented (GP0-E1 bits [6:5]):
   - 0: `(src + dst) / 2`
   - 1: `src + dst`  (clamped to 31 per channel)
@@ -60,74 +122,32 @@ bit when it read the `0x00FFFFFF` end-of-list sentinel.
 
 ---
 
-### CDROM irq_en_ Gating (Task D — Partial)
-**Changes applied in `src/cdrom/CDRom.cpp` / `src/cdrom/CDRom.hpp`:**
-
-- `push_response_n()` now only calls `irq_.set(CDROM)` when the fired INT type is
-  enabled by `irq_en_`: `(irq_en_ & (1u << (irq_fl_ - 1u))) != 0`.
-  Previously it fired unconditionally, causing spurious CPU exceptions during
-  direct-register-polling sections (like `cdrom/timing`'s disc-read timing loop
-  which sets `irq_en_=0` before polling).
-- `write()` at reg3/index0 now re-asserts the IRQ if `irq_fl_` is pending when
-  `irq_en_` is written.
-- `irq_en_` initialised to `0x1Fu` (all 5 INT types enabled — matches BIOS default).
-- All debug `fprintf` prints and `total_cmds` counter removed.
-
-**Remaining issue:** `cdrom/timing.exe` still hangs at PC=0x80011610 after psxcd
-`Init Ok!` is never printed. The test runs in an infinite VBlank IRQ loop without
-CDROM interrupts completing. Root cause still under investigation — likely the psxcd
-initialization path has a deeper interaction with the IRQ enable/clear sequence that
-isn't yet modelled correctly.
-
-**TODO:**
-- Trace the exact IRQ-enable sequence the psxcd library uses during `psxcd_init()`.
-- Verify that `write(reg3, index=1, val)` (write-1-to-clear) also re-checks whether
-  to de-assert the CPU IRQ line after clearing flags.
-- Consider whether the CDROM IRQ acknowledgement path in `Bus.cpp` needs to clear
-  `I_STAT` bit 2 when `irq_fl_` is cleared (currently only the CPU ISR does it).
-
----
-
-## Earlier Fixes
-
-### Branch Delay Slot EPC Bug (FIXED)
-The CPU was setting EPC to the wrong address when an interrupt fired during a branch
-delay slot.
-
-**Fix in `src/cpu/CPU.hpp` / `src/cpu/CPU.cpp`:**
-- Added `current_epc_` / `current_bd_` pre-computed fields; all branch/jump handlers
-  set `in_delay_slot_ = true`; `check_irq()` / `exception()` use these directly.
-
-### Scratchpad IBE Exception (FIXED — cpu/code-in-io 3/3)
-Instruction fetch from scratchpad (`0x1F800000–0x1F8003FF`) now raises Bus Error
-Instruction exception (ExceptionCode::IBE = 6).
-
-### A(0x40) hookUnresolvedExceptionHandler (FIXED)
-BIOS A-function 0x40 now intercepted and silently no-ops.
-
-### Timer Sync Modes (FIXED — commit `888af9d`)
-All four sync modes for Timer 0/1 implemented; HBlank/VBlank edge events modelled.
-
-### `timers/timers` Hang — `$ra` clobber in sideload stubs (FIXED)
-Exception handler now saves/restores `$ra` around `irq_dispatch` (Bus.cpp sideload).
-
----
-
 ## Known Issues / Next Work
 
-### 1. CDROM timing (`cdrom/timing`) — Stuck
-See CDROM section above. psxcd init doesn't complete; disc-read timing measurements
-never execute. The irq_en_ gating fix is logically correct; the init sequence hang
-needs further tracing.
+### 1. dma/dpcr — needs SPU DMA ch4
+The dpcr test exercises DMA channel 4 (SPU). Currently stubbed to no-op (immediately
+completes, transfers no data). Will be addressed when SPU RAM is implemented.
 
-### 2. SPU — Not Implemented
-24 voices, ADSR, pitch conversion, DMA CH4. Largest remaining task (~16–32h).
+### 2. SPU — Minimal Stub Only
+24-voice synthesis, ADSR, pitch, reverb not implemented. The `spu_regs_[]` register
+file passthrough is sufficient for the automated tests. DMA channel 4 silently completes
+without transferring data.
 
-### 3. MDEC — Not Implemented
+Remaining SPU work needed for full test coverage:
+- SPU RAM buffer (512 KB at 0x1F801DA6/0x1F801DA8 transfer interface)
+- DMA ch4 actual data transfer (to/from SPU RAM ↔ main RAM)
+- SPUSTAT[5:0] to mirror SPUCNT[5:0] (currently a passthrough; reads from different offset)
 
-### 4. Other unrun CDROM tests
-`cdrom/getloc`, `cdrom/disc-swap`, `cdrom/terminal` — likely need the timing fix to
-complete first.
+### 3. GPU Visual Tests — Not Compared
+15 GPU visual tests (`triangle`, `quad`, `rectangles`, `lines`, etc.) produce VRAM dumps
+but have not been pixel-compared against reference PNGs yet.
+
+### 4. MDEC — Not Implemented
+Hardware JPEG-like decoder. Needed for 9 MDEC tests.
+
+### 5. Joypad (input/pad)
+SIO0 digital pad stub is in place (all buttons released response). The `input/pad` test
+has not been run yet.
 
 ---
 
@@ -144,12 +164,13 @@ complete first.
 - Software rasteriser: triangles, quads, lines, rectangles
 - VRAM: 1024×512 16bpp
 - Semi-transparency: all 4 blend modes (GP0-E1 bits [6:5])
-- VBlank every `kVBlankPeriod = 100,000` cycles (real NTSC ≈ 564,480 — kept fast for tests)
+- VBlank every `kVBlankPeriod = 568,000` cycles (NTSC accurate)
 
 ### Timers (`src/timers/Timers.cpp`)
 - Three 16-bit counters; sys / dot / HBlank-count / sys/8 clock sources
 - All sync modes for T0 (HBlank gate) and T1 (VBlank gate) implemented
 - T2 sync modes 0/3 stop permanently; 1/2 free-run
+- Dotclock: sys × 11 / (dot_divisor × 7); sys/8: one tick per 8 CPU cycles
 
 ### DMA (`src/dma/DMA.cpp`)
 - OTC (ch6) ✓, GPU LL (ch2) ✓, GPU VRAM (ch2 sync=2) ✓
@@ -159,13 +180,17 @@ complete first.
 
 ### CDROM (`src/cdrom/CDRom.cpp`)
 - Commands: GetStat, Setloc, ReadN/S, Stop, Pause, Init, Mute/Demute, Setmode,
-  Getparam, GetTN, GetTD, SeekL/P, GetID
-- Async response timing via `Sched` (s1_ / s2_) + continuous sector stream
+  Getparam, GetTN, GetTD, SeekL/P, GetlocL, GetlocP, GetID
+- Timing constants: kAck1=50K, kAck1Read=35K, kSect1_1x=5M, kSectN_1x=448K cycles
+- Signed LBA (`int32_t`) supports lead-in/pregap seeks (negative LBA)
+- `loc_valid_`: set after first seek/read; not reset by Init (soft reset)
+- `pos_valid_`: tracks Q-subchannel validity; false only after out-of-range seek
 - `irq_en_` gating: CDROM only asserts CPU IRQ when INT type is enabled (bit-correct)
-- **Known issue:** psxcd init sequence still hangs — see TODO above
 
-### SPU
-- Stub only (reads return 0, writes ignored)
+### SPU (`src/bus/Bus.cpp`)
+- Register file passthrough via `spu_regs_[0x280]` covering 0x1F801C00–0x1F801E7F
+- 16-bit, 32-bit, 8-bit R/W all backed by the array
+- No actual synthesis, no SPU RAM, no DMA data transfer
 
 ### MDEC
 - Not implemented
