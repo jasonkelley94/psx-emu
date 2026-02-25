@@ -93,9 +93,8 @@ int main(int argc, char* argv[]) {
         // ps1-tests set SP=0 in the EXE header; supply the conventional default.
         cpu->set_reg(29u, info.sp ? info.sp : 0x801F'FFF0u);
 
-        // Default to headless + a generous cycle budget when running test EXEs.
-        headless = true;
-        if (max_cycles == 0u) max_cycles = 20'000'000u;
+        // Default cycle budget for headless runs; interactive loop ignores it.
+        if (headless && max_cycles == 0u) max_cycles = 20'000'000u;
 
     } else {
         // ── Normal mode: BIOS boot, optional disc image ───────────────────────
