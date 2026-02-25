@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
+
+      - name: Build (Release)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+      - name: Fetch ps1-tests
+        run: bash tests/fetch_tests.sh
+
+      - name: Run test suite
+        run: bash tests/run_tests.sh
+
+      - name: Upload VRAM dump on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vram-dump
+          path: vram.ppm
+          if-no-files-found: ignore
