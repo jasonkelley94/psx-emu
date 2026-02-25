@@ -99,4 +99,12 @@ private:
     // Called after any transfer completes — updates CHCR, DICR, and IRQ.
     void finish(u32 n) noexcept;
     void update_irq() noexcept;
+
+public:
+    // Consume CPU cycles credited during chopped transfers (for Bus to tick timers).
+    u32 take_cpu_credit() noexcept { const u32 c = cpu_credit_; cpu_credit_ = 0; return c; }
+
+private:
+    // Accumulated CPU cycles yielded during chopped DMA bursts.
+    u32 cpu_credit_ = 0;
 };

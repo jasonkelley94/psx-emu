@@ -93,6 +93,32 @@ private:
     static constexpr u32 SPU_REG_SIZE = 0x280u;
     std::array<u8, SPU_REG_SIZE> spu_regs_{};
 
+    // ── SIO0 / Joypad state ───────────────────────────────────────────────────
+    // Implements the minimal digital-pad exchange protocol so BIOS pad detection
+    // succeeds and ps1-tests input/pad.exe can read button state.
+    //
+    // Exchange sequence (host sends → controller responds):
+    //   byte 0: 0x01 (addr)    → 0xFF
+    //   byte 1: 0x42 (poll)   → 0x41 (digital pad, 1 halfword payload)
+    //   byte 2: 0x00 (TAP)    → 0x5A (payload header)
+    //   byte 3: 0x00          → buttons_lo  (active-low)
+    //   byte 4: 0x00          → buttons_hi  (active-low)
+    //
+    // JOY_STAT layout:
+    //   bit 0 TXRDY1: always 1  (TX FIFO has room)
+    //   bit 1 RXFIFO: 1 when a response byte is waiting
+    //   bit 2 TXRDY2: always 1
+    //   bit 7 ACKINPUT: 0 (active) after each write (controller ACK), 1 otherwise
+    struct JoyState {
+        u16  buttons  = 0xFFFFu;   // active-low (0=pressed, 1=released)
+        u8   rx_byte  = 0xFFu;
+        bool rx_ready = false;
+        u8   seq      = 0u;
+    };
+    mutable JoyState joy_{};
+
+    void joy_data_write(u8 b) noexcept;
+
     // VBlank generation — fire IRQ0 every ~100,000 cycles.
     static constexpr u32 kVBlankPeriod    = 100'000u;
     // VBlank active duration: ~5% of frame (~10 scanlines of the 263 total).

@@ -15,7 +15,7 @@ u32 DMA::read(u32 off) const noexcept {
             switch (reg) {
                 case 0: return ch_[n].madr;
                 case 1: return ch_[n].bcr;
-                case 2: return ch_[n].chcr;
+                case 2:  return ch_[n].chcr;
                 default: break;
             }
         }
@@ -80,7 +80,10 @@ void DMA::write(u32 off, u32 value) noexcept {
 
         // Mode 0 (burst) requires both the busy bit AND the trigger bit.
         // Modes 1 and 2 start on busy alone (device sync'd or linked-list).
-        const bool should_run = busy && (sync != 0 || trigger);
+        // Exception: GPU→RAM (ch2, dir=1) uses hardware DREQ from the GPU which
+        // is implicitly asserted when armed for VRAM readback — no bit 28 needed.
+        const bool gpu_dreq = (n == 2u) && (ch_[n].chcr & 1u);
+        const bool should_run = busy && (sync != 0 || trigger || gpu_dreq);
 
         if (should_run && channel_enabled(n)) {
             start_transfer(n);
@@ -211,27 +214,62 @@ void DMA::run_gpu_ll(u32 n) noexcept {
 // Mode 1 (slice):  BCR[15:0] × BCR[31:16] = total word count
 //
 // Both modes stream words from RAM to GP0 sequentially.
+// When chopping is enabled (CHCR bit 8), the transfer is split into DMA-window
+// bursts separated by CPU-window pauses.  The CPU cycles yielded per pause are
+// accumulated in cpu_credit_ so Bus can advance the timers accordingly.
+//
+// Chopping fields in CHCR:
+//   [8]     chop enable
+//   [18:16] DMA window size = 2^N words  (used for burst/sync-0 mode)
+//   [22:20] CPU window size = 2^N cycles (credited between every burst)
+//
+// In slice mode (sync=1) the natural burst unit is the block size (BCR[15:0])
+// because the DMA already pauses between blocks waiting for the device signal.
 void DMA::run_gpu_block(u32 n) noexcept {
     u32 addr = ch_[n].madr & 0x00FF'FFFFu;  // 24-bit MADR, consistent with OTC
-    const u32 sync = (ch_[n].chcr >> 9) & 3u;
+    const u32 chcr = ch_[n].chcr;
+    const u32 sync = (chcr >> 9) & 3u;
+    const bool chop = (chcr >> 8) & 1u;
+    const s32 step = (chcr & 2u) ? -4 : 4;  // CHCR bit 1
 
     u32 total;
+    u32 burst;   // words per DMA burst (for chopping)
     if (sync == 1) {
         // Slice mode: block-size × block-count
         const u32 bs = ch_[n].bcr & 0xFFFFu;
         const u32 ba = (ch_[n].bcr >> 16) & 0xFFFFu;
         total = bs * ba;
+        // In slice mode each block is the natural chopping unit.
+        burst = (bs > 0u) ? bs : 1u;
     } else {
         // Burst mode: raw word count
         total = ch_[n].bcr & 0xFFFFu;
         if (total == 0) total = 0x1'0000u;
+        // Chopping DMA window from CHCR[18:16]; without chopping, run all at once.
+        burst = chop ? (1u << ((chcr >> 16) & 7u)) : total;
     }
 
-    const s32 step = (ch_[n].chcr & 2u) ? -4 : 4;  // CHCR bit 1
+    const u32 cpu_window = chop ? (1u << ((chcr >> 20) & 7u)) : 0u;
 
-    for (u32 i = 0; i < total; ++i) {
-        gpu_.write(0, ram_.read<u32>(addr & (Ram::SIZE - 1u)));
-        addr = static_cast<u32>(static_cast<s32>(addr) + step);
+    u32 remaining = total;
+    while (remaining > 0) {
+        const u32 n_words = (burst < remaining) ? burst : remaining;
+        for (u32 i = 0; i < n_words; ++i) {
+            gpu_.write(0, ram_.read<u32>(addr & (Ram::SIZE - 1u)));
+            addr = static_cast<u32>(static_cast<s32>(addr) + step);
+        }
+        remaining -= n_words;
+        // Credit CPU cycles between bursts (not after the last burst).
+        if (chop && remaining > 0u) {
+            cpu_credit_ += 6u + cpu_window;  // bus overhead + CPU yield window
+        }
+    }
+
+    // Credit DMA transfer time (1 cycle/word) + slice-mode inter-block overhead.
+    cpu_credit_ += total;
+    if (sync == 1u && !chop) {
+        const u32 bs = ch_[n].bcr & 0xFFFFu;  // words per block
+        cpu_credit_ += (bs > 0u ? total / bs : 0u) * 10u;  // 10 cycles/block DREQ
     }
 
     finish(n);
@@ -244,14 +282,28 @@ void DMA::run_gpu_block(u32 n) noexcept {
 //
 // Mode 0 (burst):  BCR[15:0]        = word count
 // Mode 1 (slice):  BCR[15:0] × BCR[31:16] = word count
+//
+// Timing credits: we credit the timer with the approximate sys-clock cycles the
+// real DMA controller would consume, so that timer-based chopping measurements
+// reflect realistic timing rather than zero (our DMA runs synchronously).
+//
+//   Slice mode (sync=1): 1 cycle/word (GPU output rate) +
+//                        ~10 cycles/block (DREQ re-assertion turnaround)
+//   Burst no-chop (sync=0, bit8=0): 1 cycle/word
+//   Burst with chop (sync=0, bit8=1): 1 cycle/word +
+//                        (6 + cpu_window) cycles/burst  (bus overhead + yield)
 void DMA::run_vram_read(u32 n) noexcept {
     u32 addr = ch_[n].madr & 0x00FF'FFFFu;
-    const u32 sync = (ch_[n].chcr >> 9u) & 3u;
+    const u32 chcr = ch_[n].chcr;
+    const u32 sync = (chcr >> 9u) & 3u;
+    const bool chop = (chcr >> 8u) & 1u;
 
     u32 total;
+    u32 bs = 0;   // block size (slice mode)
+    u32 ba = 0;   // block count (slice mode)
     if (sync == 1u) {
-        const u32 bs = ch_[n].bcr & 0xFFFFu;
-        const u32 ba = (ch_[n].bcr >> 16u) & 0xFFFFu;
+        bs = ch_[n].bcr & 0xFFFFu;
+        ba = (ch_[n].bcr >> 16u) & 0xFFFFu;
         total = bs * ba;
     } else {
         total = ch_[n].bcr & 0xFFFFu;
@@ -261,6 +313,22 @@ void DMA::run_vram_read(u32 n) noexcept {
     for (u32 i = 0; i < total; ++i) {
         ram_.write<u32>(addr & (Ram::SIZE - 1u), gpu_.read(0u));
         addr = (addr + 4u) & 0x00FF'FFFFu;
+    }
+
+    // ── Timing credits ────────────────────────────────────────────────────────
+    // Credit the DMA transfer time (1 cycle/word) always.
+    cpu_credit_ += total;
+
+    if (sync == 1u) {
+        // Slice mode: ~10 cycles per block for DREQ re-assertion between blocks.
+        const u32 n_blocks = (bs > 0u) ? ba : 0u;
+        cpu_credit_ += n_blocks * 10u;
+    } else if (chop) {
+        // Burst mode with chopping: 6 cycles bus overhead + cpu_window per burst.
+        const u32 burst_size  = 1u << ((chcr >> 16u) & 7u);
+        const u32 cpu_window  = 1u << ((chcr >> 20u) & 7u);
+        const u32 n_bursts    = (burst_size > 0u) ? (total / burst_size) : total;
+        cpu_credit_ += n_bursts * (6u + cpu_window);
     }
 
     finish(n);

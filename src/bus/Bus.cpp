@@ -7,7 +7,7 @@ Bus::Bus(std::unique_ptr<Bios> bios)
     , gpu_   (std::make_unique<GPU>())
     , irq_   (std::make_unique<IRQ>())
     , cdrom_ (std::make_unique<CDRom>(*irq_))
-    , timers_(std::make_unique<Timers>(*irq_))
+    , timers_(std::make_unique<Timers>(*irq_, *gpu_))
       // DMA constructed last — it holds non-owning references to the above.
     , dma_   (std::make_unique<DMA>(*ram_, *gpu_, *irq_, *cdrom_))
 {}
@@ -72,14 +72,25 @@ u32 Bus::io_read32(u32 phys) const noexcept {
         return timers_->read(off - 0x100u);
     }
 
-    // ── Joypad / SIO (0x040–0x05F) ───────────────────────────────────────────
-    // Return TX-ready with no RX data and no ACK — controller not connected.
-    // The BIOS times out waiting for /ACK and continues to the shell.
+    // ── Joypad / SIO0 (0x040–0x04F) ─────────────────────────────────────────
     // SIO1 (0x050–0x05F): PSN00BSDK polls SIO_STAT(1) for TX-ready bits.
-    if (off >= 0x040u && off < 0x060u) {
-        if (off >= 0x050u)                 return 0x0000'0005u;  // SIO1_STAT: TX ready
-        if ((off & ~0x3u) == 0x044u)       return 0x0000'0005u;  // JOY_STAT
-        return 0u;
+    if (off >= 0x050u && off < 0x060u) {
+        return 0x0000'0005u;  // SIO1_STAT: TX ready, no RX
+    }
+    if (off >= 0x040u && off < 0x050u) {
+        switch (off & ~0x3u) {
+        case 0x040u: {  // JOY_DATA — consume and clear RX FIFO
+            const u8 v = joy_.rx_byte;
+            joy_.rx_ready = false;
+            return static_cast<u32>(v);
+        }
+        case 0x044u:  // JOY_STAT
+            // bit 0 TXRDY1 = 1, bit 2 TXRDY2 = 1, bit 1 RXFIFO, bit 7 ACKINPUT
+            // ACKINPUT = 0 (ACK active/low) when RX data ready, 1 when idle.
+            return 0x00000005u | (joy_.rx_ready ? 0x00000002u : 0x00000080u);
+        default:
+            return 0u;  // JOY_MODE, JOY_CTRL, JOY_BAUD
+        }
     }
 
     // ── Memory control registers — ignored, return 0 ─────────────────────────
@@ -115,6 +126,9 @@ void Bus::io_write32(u32 phys, u32 value) noexcept {
     // ── DMA ───────────────────────────────────────────────────────────────────
     if (off >= DMA_BASE_OFF && off < DMA_END_OFF) {
         dma_->write(off - DMA_BASE_OFF, value);
+        // Advance timers by any CPU cycles yielded during chopped DMA bursts.
+        if (const u32 c = dma_->take_cpu_credit(); c > 0u)
+            tick(c);
         return;
     }
 
@@ -135,9 +149,13 @@ void Bus::io_write32(u32 phys, u32 value) noexcept {
         return;
     }
 
-    // ── Joypad / SIO (0x040–0x05F) — swallow writes ──────────────────────────
+    // ── Joypad / SIO0 (0x040–0x04F) ─────────────────────────────────────────
     if (off >= 0x040u && off < 0x060u) {
-        return;
+        if (off == 0x040u) joy_data_write(static_cast<u8>(value));  // JOY_DATA
+        if (off == 0x04Au) {  // JOY_CTRL: bit 6 (reset) or bit 4 (ack) resets seq
+            if (value & (1u << 6u)) { joy_.seq = 0u; joy_.rx_ready = false; }
+        }
+        return;  // other SIO0/SIO1 writes silently ignored
     }
 
     // ── SPU (0x1F80_1C00 – 0x1F80_1E7F) — register file, preserves writes ───
@@ -167,8 +185,13 @@ void Bus::io_write16(u32 phys, u16 value) noexcept {
         return;
     }
 
-    // ── Joypad / SIO ──────────────────────────────────────────────────────────
-    if (off >= 0x040u && off < 0x060u) return;
+    // ── Joypad / SIO0 (16-bit writes) ────────────────────────────────────────
+    if (off >= 0x040u && off < 0x060u) {
+        if (off == 0x04Au) {  // JOY_CTRL halfword write
+            if (value & (1u << 6u)) { joy_.seq = 0u; joy_.rx_ready = false; }
+        }
+        return;
+    }
 
     // ── SPU (16-bit writes) — store into register file ───────────────────────
     if (off >= 0xC00u && off < 0xE80u) {
@@ -211,9 +234,11 @@ void Bus::io_write8(u32 phys, u8 value) noexcept {
     }
 
     // ── Joypad / SIO ─────────────────────────────────────────────────────────
-    // SIO_DATA(1) at offset 0x050 carries PSN00BSDK printf byte output.
+    // SIO0 (0x040–0x04F): JOY_DATA byte writes feed the exchange FSM.
+    // SIO1 (0x050–0x05F): SIO_DATA(1) carries PSN00BSDK printf byte output.
     if (off >= 0x040u && off < 0x060u) {
-        if (off == 0x050u) tty_putchar(static_cast<char>(value));
+        if (off == 0x040u) joy_data_write(value);              // JOY_DATA
+        else if (off == 0x050u) tty_putchar(static_cast<char>(value));  // TTY
         return;
     }
 
@@ -239,6 +264,43 @@ void Bus::io_write8(u32 phys, u8 value) noexcept {
 
     std::fprintf(stderr, "[Bus] unhandled I/O write8  off=0x%04X val=0x%02X\n",
                  off, static_cast<u32>(value));
+}
+
+// ── SIO0 joypad exchange state machine ───────────────────────────────────────
+// Called each time the host writes a byte to JOY_DATA (0x1F801040).
+// Advances the per-transaction sequence and prepares the response byte.
+void Bus::joy_data_write(u8 b) noexcept {
+    switch (joy_.seq) {
+    case 0:  // Address byte — only advance if host is addressing pad 1 (0x01)
+        joy_.rx_byte = 0xFF;
+        joy_.seq     = (b == 0x01u) ? 1u : 0u;
+        break;
+    case 1:  // Command byte: 0x42 = poll → respond with digital-pad ID (0x41)
+        joy_.rx_byte = (b == 0x42u) ? 0x41u : 0xFFu;
+        joy_.seq     = 2u;
+        break;
+    case 2:  // TAP request byte → respond with payload-start token (0x5A)
+        joy_.rx_byte = 0x5Au;
+        joy_.seq     = 3u;
+        break;
+    case 3:  // First data byte → button state, low byte (active-low)
+        joy_.rx_byte = static_cast<u8>(joy_.buttons);
+        joy_.seq     = 4u;
+        break;
+    case 4:  // Second data byte → button state, high byte; end of exchange
+        joy_.rx_byte = static_cast<u8>(joy_.buttons >> 8u);
+        joy_.seq     = 0u;
+        break;
+    default:
+        joy_.rx_byte = 0xFF;
+        joy_.seq     = 0u;
+        break;
+    }
+    joy_.rx_ready = true;
+    // Fire IRQ7 (Controller) to emulate the /ACK pulse driven by the real pad.
+    // Interrupt-driven SIO0 code (PSN00BSDK PadInit) waits for IRQ7 before
+    // reading JOY_DATA, so without this the pad ISR never executes.
+    irq_->set(IRQSource::Ctrl);
 }
 
 // ── TTY putchar ───────────────────────────────────────────────────────────────
@@ -332,9 +394,9 @@ Bus::PsxExeInfo Bus::sideload(const char* path) noexcept {
     // registered ISR.  PSN00BSDK calls B(0x19)=SetCustomExitFromException(ptr)
     // which stores a struct {fn, ?, ?, callback_table} at a known address.
     // When an IRQ fires our handler reads the struct, sets up $s0/$s1 for the
-    // PSN00BSDK irq_dispatch loop, saves $s0/$s1/EPC for B(0x17)'s restoration,
-    // then jumps into the dispatcher.  B(0x17)=ReturnFromException restores the
-    // saved state and returns to EPC via rfe.
+    // PSN00BSDK irq_dispatch loop, saves $s0/$s1/$ra/EPC for B(0x17)'s
+    // restoration, then jumps into the dispatcher.  B(0x17)=ReturnFromException
+    // restores the saved state and returns to EPC via rfe.
     //
     // Memory layout installed at load time (all physical addresses):
     //
@@ -349,6 +411,7 @@ Bus::PsxExeInfo Bus::sideload(const char* path) noexcept {
     //                  +0x08  Process*      (fixed = 0x0400; getCurrentThread reads here)
     //                  +0x0C  saved EPC     (IRQ path; read by B(0x17))
     //                  +0x10  ISR struct ptr (written by B(0x19))
+    //                  +0x14  saved $ra     (IRQ path; read by B(0x17))
     //
     //   0x0000'01E4  Return-from-exception stub (8 instructions):
     //                  reads returnPC from Thread struct, returns via rfe+jr
@@ -391,8 +454,9 @@ Bus::PsxExeInfo Bus::sideload(const char* path) noexcept {
     wram(0x0000'00C4u, 0x00000000u);   // nop
 
     // ── Extended exception handler at 0x0000_0120 ─────────────────────────────
-    // Reads Cause.ExcCode; for IRQ (ExcCode==0) saves $s0/$s1/EPC and jumps
-    // to the registered ISR.  For non-IRQ exceptions returns directly to EPC.
+    // Reads Cause.ExcCode; for IRQ (ExcCode==0) jumps to the full-context-save
+    // trampoline at 0x0580 which saves ALL caller-saved registers before entering
+    // the ISR.  For non-IRQ exceptions returns directly to EPC.
     //
     // Pseudo-code:
     //   k0 = (Cause >> 2) & 0x1F   // ExcCode
@@ -402,19 +466,13 @@ Bus::PsxExeInfo Bus::sideload(const char* path) noexcept {
     //  irq:
     //   k0 = mem[0x110]             // ISR struct ptr (B(0x19) registration)
     //   if (k0 == 0) goto no_isr   // nothing registered
-    //   mem[0x100] = s0             // save interrupted program's s0
-    //   mem[0x104] = s1             //   and s1
-    //   k1 = EPC; mem[0x108] = k1  // save EPC for B(0x17)
-    //   k1 = k0[0xC]               // callback table  → s0
-    //   k0 = k0[0x0]               // ISR function addr
-    //   s0 = k1; s1 = 0            // set up loop regs for irq_dispatch
-    //   jr k0                      // enter ISR (ISR calls B(0x17) to return)
+    //   j 0x80000580               // → full-save trampoline (saves ALL caller-saved regs)
     //  no_isr:
     //   k0 = EPC; jr k0; rfe       // return to interrupted code
     wram(0x0000'0120u, 0x401A6800u);   // [0]  mfc0 $k0, $13  (Cause)
     wram(0x0000'0124u, 0x001AD082u);   // [1]  srl  $k0, $k0, 2
     wram(0x0000'0128u, 0x335A001Fu);   // [2]  andi $k0, $k0, 0x1F
-    wram(0x0000'012Cu, 0x13400003u);   // [3]  beq  $k0, $zero, +3  (→ irq)
+    wram(0x0000'012Cu, 0x13400003u);   // [3]  beq  $k0, $zero, +3  (→ irq at 0x013C)
     wram(0x0000'0130u, 0x401B7000u);   // [4]  mfc0 $k1, $14  [delay slot]
     wram(0x0000'0134u, 0x03600008u);   // [5]  jr   $k1        (non-IRQ: return to EPC)
     wram(0x0000'0138u, 0x42000010u);   // [6]  rfe             [delay slot]
@@ -422,31 +480,24 @@ Bus::PsxExeInfo Bus::sideload(const char* path) noexcept {
     wram(0x0000'013Cu, 0x3C1A0000u);   // [7]  lui  $k0, 0
     wram(0x0000'0140u, 0x8F5A0110u);   // [8]  lw   $k0, 0x110($k0)  (struct ptr)
     wram(0x0000'0144u, 0x00000000u);   // [9]  nop  (load delay)
-    wram(0x0000'0148u, 0x1340000Cu);   // [10] beq  $k0, $zero, +12  (→ no_isr)
+    wram(0x0000'0148u, 0x13400003u);   // [10] beq  $k0, $zero, +3  (→ no_isr at 0x0158)
     wram(0x0000'014Cu, 0x00000000u);   // [11] nop  [delay slot]
-    wram(0x0000'0150u, 0xAC100100u);   // [12] sw   $s0, 0x100($zero)
-    wram(0x0000'0154u, 0xAC110104u);   // [13] sw   $s1, 0x104($zero)
-    wram(0x0000'0158u, 0x401B7000u);   // [14] mfc0 $k1, $14  (EPC)
-    wram(0x0000'015Cu, 0x00000000u);   // [15] nop  (COP0 load latency)
-    wram(0x0000'0160u, 0xAC1B010Cu);   // [16] sw   $k1, 0x10C($zero)  (EPC save; 0x108=Process*)
-    wram(0x0000'0164u, 0x8F5B000Cu);   // [17] lw   $k1, 0xC($k0)   (callback tbl)
-    wram(0x0000'0168u, 0x8F5A0000u);   // [18] lw   $k0, 0x0($k0)   (ISR fn addr)
-    wram(0x0000'016Cu, 0x03608025u);   // [19] or   $s0, $k1, $zero  (s0=callback tbl)
-    wram(0x0000'0170u, 0x24110000u);   // [20] addiu $s1, $zero, 0   (s1=0, start bit)
-    wram(0x0000'0174u, 0x03400008u);   // [21] jr   $k0   → ISR
-    wram(0x0000'0178u, 0x00000000u);   // [22] nop  [delay slot]
-    // no_isr:
-    wram(0x0000'017Cu, 0x401A7000u);   // [23] mfc0 $k0, $14  (EPC)
-    wram(0x0000'0180u, 0x00000000u);   // [24] nop
-    wram(0x0000'0184u, 0x03400008u);   // [25] jr   $k0
-    wram(0x0000'0188u, 0x42000010u);   // [26] rfe  [delay slot]
+    // ISR path: jump to full-context-save trampoline (saves $at,$v0,$v1,$a0-$a3,$t0-$t9)
+    wram(0x0000'0150u, 0x08000160u);   // [12] j    0x80000580  (full-save trampoline)
+    wram(0x0000'0154u, 0x00000000u);   // [13] nop  [delay slot]
+    // no_isr: no ISR registered — return directly to EPC
+    wram(0x0000'0158u, 0x401A7000u);   // [14] mfc0 $k0, $14  (EPC)
+    wram(0x0000'015Cu, 0x00000000u);   // [15] nop  (COP0 latency)
+    wram(0x0000'0160u, 0x03400008u);   // [16] jr   $k0
+    wram(0x0000'0164u, 0x42000010u);   // [17] rfe  [delay slot]
+    // 0x0168-0x0188: padding (unreachable with new flow)
 
     // ── B-function dispatcher at 0x0000_0190 ──────────────────────────────────
     // Dispatches on $t1 (the BIOS function number loaded before "jr $t2").
     //
-    // B(0x17) ReturnFromException — restores $s0/$s1 from save area, loads EPC,
-    //   returns to EPC via rfe.  Called by the PSN00BSDK irq_dispatch epilogue.
-    //   NB: EPC is now saved at 0x10C (not 0x108; that slot holds Process*).
+    // B(0x17) ReturnFromException — restores $s0/$s1/$ra from save area, loads
+    //   EPC, returns to EPC via rfe.  Called by the PSN00BSDK irq_dispatch
+    //   epilogue.  NB: EPC is saved at 0x10C; $ra is saved at 0x114.
     // B(0x18) SetDefaultExitFromException — clears ISR registration (mem[0x110]=0).
     // B(0x19) SetCustomExitFromException(ptr) — stores a0 (struct ptr) in mem[0x110].
     // All others — jr $ra (harmless no-op).
@@ -457,7 +508,7 @@ Bus::PsxExeInfo Bus::sideload(const char* path) noexcept {
     //   check 0x18 → b18  (branch offset +10 after delay slot)
     //   jr $ra             (default)
     //  b19: sw $a0, 0x110($zero); jr $ra
-    //  b17: lw $s0,0x100; lw $s1,0x104; lw $k0,0x10C; nop; jr $k0; rfe
+    //  b17: lw $s0,0x100; lw $s1,0x104; lw $k0,0x10C; lw $ra,0x114; jr $k0; rfe
     //  b18: sw $zero,0x110($zero); jr $ra
     //
     // Registers: $t1=9 (fn#), $at=1 (scratch), $a0=4 (arg to B(0x19))
@@ -474,13 +525,12 @@ Bus::PsxExeInfo Bus::sideload(const char* path) noexcept {
     wram(0x0000'01B4u, 0xAC040110u);   // [9]  sw    $a0, 0x110($zero)
     wram(0x0000'01B8u, 0x03E00008u);   // [10] jr    $ra
     wram(0x0000'01BCu, 0x00000000u);   // [11] nop
-    // b17: ReturnFromException — restore state and return to EPC
-    wram(0x0000'01C0u, 0x8C100100u);   // [12] lw    $s0, 0x100($zero)
-    wram(0x0000'01C4u, 0x8C110104u);   // [13] lw    $s1, 0x104($zero)
-    wram(0x0000'01C8u, 0x8C1A010Cu);   // [14] lw    $k0, 0x10C($zero)  (EPC save slot)
-    wram(0x0000'01CCu, 0x00000000u);   // [15] nop   (load delay for $k0)
-    wram(0x0000'01D0u, 0x03400008u);   // [16] jr    $k0
-    wram(0x0000'01D4u, 0x42000010u);   // [17] rfe   [delay slot]
+    // b17: ReturnFromException — jump to full-context-restore routine at 0x80000650
+    // That routine restores $at,$v0,$v1,$a0-$a3,$t0-$t9,$s0,$s1,$ra then returns
+    // to the saved EPC via rfe, leaving the interrupted program's registers intact.
+    wram(0x0000'01C0u, 0x08000194u);   // [12] j    0x80000650  (full-restore routine)
+    wram(0x0000'01C4u, 0x00000000u);   // [13] nop  [delay slot]
+    // [14]-[17] at 0x01C8-0x01D4: unreachable padding
     // b18: SetDefaultExitFromException — clear ISR registration
     wram(0x0000'01D8u, 0xAC000110u);   // [18] sw    $zero, 0x110($zero)
     wram(0x0000'01DCu, 0x03E00008u);   // [19] jr    $ra
@@ -550,6 +600,76 @@ Bus::PsxExeInfo Bus::sideload(const char* path) noexcept {
         wram(0x0000'0500u + i * 4u, 0x0000'00A0u);
     }
 
+    // ── Full-context-save trampoline at 0x0000_0580 ───────────────────────────
+    // Entered via j from exception handler when an IRQ fires and an ISR is
+    // registered.  Saves ALL caller-saved registers ($at,$v0,$v1,$a0-$a3,$t0-$t9)
+    // to 0x600-0x640, then saves $s0/$s1/EPC/$ra and enters the ISR.
+    //
+    // Save area layout (physical RAM):
+    //   0x0600: $at  0x0604: $v0  0x0608: $v1
+    //   0x060C: $a0  0x0610: $a1  0x0614: $a2  0x0618: $a3
+    //   0x061C: $t0  0x0620: $t1  0x0624: $t2  0x0628: $t3
+    //   0x062C: $t4  0x0630: $t5  0x0634: $t6  0x0638: $t7
+    //   0x063C: $t8  0x0640: $t9
+    //
+    // On entry: $k0 = ISR struct pointer (set by the exception handler).
+    wram(0x0000'0580u, 0xAC010600u);   // [0]  sw   $at, 0x600($zero)
+    wram(0x0000'0584u, 0xAC020604u);   // [1]  sw   $v0, 0x604($zero)
+    wram(0x0000'0588u, 0xAC030608u);   // [2]  sw   $v1, 0x608($zero)
+    wram(0x0000'058Cu, 0xAC04060Cu);   // [3]  sw   $a0, 0x60C($zero)
+    wram(0x0000'0590u, 0xAC050610u);   // [4]  sw   $a1, 0x610($zero)
+    wram(0x0000'0594u, 0xAC060614u);   // [5]  sw   $a2, 0x614($zero)
+    wram(0x0000'0598u, 0xAC070618u);   // [6]  sw   $a3, 0x618($zero)
+    wram(0x0000'059Cu, 0xAC08061Cu);   // [7]  sw   $t0, 0x61C($zero)
+    wram(0x0000'05A0u, 0xAC090620u);   // [8]  sw   $t1, 0x620($zero)
+    wram(0x0000'05A4u, 0xAC0A0624u);   // [9]  sw   $t2, 0x624($zero)
+    wram(0x0000'05A8u, 0xAC0B0628u);   // [10] sw   $t3, 0x628($zero)
+    wram(0x0000'05ACu, 0xAC0C062Cu);   // [11] sw   $t4, 0x62C($zero)
+    wram(0x0000'05B0u, 0xAC0D0630u);   // [12] sw   $t5, 0x630($zero)
+    wram(0x0000'05B4u, 0xAC0E0634u);   // [13] sw   $t6, 0x634($zero)
+    wram(0x0000'05B8u, 0xAC0F0638u);   // [14] sw   $t7, 0x638($zero)
+    wram(0x0000'05BCu, 0xAC18063Cu);   // [15] sw   $t8, 0x63C($zero)
+    wram(0x0000'05C0u, 0xAC190640u);   // [16] sw   $t9, 0x640($zero)
+    wram(0x0000'05C4u, 0xAC100100u);   // [17] sw   $s0, 0x100($zero)
+    wram(0x0000'05C8u, 0xAC110104u);   // [18] sw   $s1, 0x104($zero)
+    wram(0x0000'05CCu, 0x401B7000u);   // [19] mfc0 $k1, $14  (EPC)
+    wram(0x0000'05D0u, 0x00000000u);   // [20] nop  (COP0 latency)
+    wram(0x0000'05D4u, 0xAC1B010Cu);   // [21] sw   $k1, 0x10C($zero)  (save EPC)
+    wram(0x0000'05D8u, 0x8F5B000Cu);   // [22] lw   $k1, 0xC($k0)   (callback tbl; load delay ok — $k1 used 2 insns later)
+    wram(0x0000'05DCu, 0x8F5A0000u);   // [23] lw   $k0, 0x0($k0)   (ISR fn addr; uses OLD $k0 ✓)
+    wram(0x0000'05E0u, 0x03608025u);   // [24] or   $s0, $k1, $zero  ($s0=callback_tbl; $k1 valid here)
+    wram(0x0000'05E4u, 0x24110000u);   // [25] addiu $s1, $zero, 0   ($s1=0; $k0 now valid)
+    wram(0x0000'05E8u, 0x03400008u);   // [26] jr   $k0  → enter ISR
+    wram(0x0000'05ECu, 0xAC1F0114u);   // [27] sw   $ra, 0x114($zero)  [delay: save $ra before ISR clobbers it]
+
+    // ── Full-context-restore routine at 0x0000_0650 ───────────────────────────
+    // Jumped to by B(0x17) (ReturnFromException).  Restores all caller-saved
+    // registers from the save area then returns to the saved EPC via rfe,
+    // leaving the interrupted program's register state completely intact.
+    wram(0x0000'0650u, 0x8C010600u);   // [0]  lw   $at, 0x600($zero)
+    wram(0x0000'0654u, 0x8C020604u);   // [1]  lw   $v0, 0x604($zero)
+    wram(0x0000'0658u, 0x8C030608u);   // [2]  lw   $v1, 0x608($zero)
+    wram(0x0000'065Cu, 0x8C04060Cu);   // [3]  lw   $a0, 0x60C($zero)
+    wram(0x0000'0660u, 0x8C050610u);   // [4]  lw   $a1, 0x610($zero)
+    wram(0x0000'0664u, 0x8C060614u);   // [5]  lw   $a2, 0x614($zero)
+    wram(0x0000'0668u, 0x8C070618u);   // [6]  lw   $a3, 0x618($zero)
+    wram(0x0000'066Cu, 0x8C08061Cu);   // [7]  lw   $t0, 0x61C($zero)
+    wram(0x0000'0670u, 0x8C090620u);   // [8]  lw   $t1, 0x620($zero)
+    wram(0x0000'0674u, 0x8C0A0624u);   // [9]  lw   $t2, 0x624($zero)
+    wram(0x0000'0678u, 0x8C0B0628u);   // [10] lw   $t3, 0x628($zero)
+    wram(0x0000'067Cu, 0x8C0C062Cu);   // [11] lw   $t4, 0x62C($zero)
+    wram(0x0000'0680u, 0x8C0D0630u);   // [12] lw   $t5, 0x630($zero)
+    wram(0x0000'0684u, 0x8C0E0634u);   // [13] lw   $t6, 0x634($zero)
+    wram(0x0000'0688u, 0x8C0F0638u);   // [14] lw   $t7, 0x638($zero)
+    wram(0x0000'068Cu, 0x8C18063Cu);   // [15] lw   $t8, 0x63C($zero)
+    wram(0x0000'0690u, 0x8C190640u);   // [16] lw   $t9, 0x640($zero)
+    wram(0x0000'0694u, 0x8C100100u);   // [17] lw   $s0, 0x100($zero)
+    wram(0x0000'0698u, 0x8C110104u);   // [18] lw   $s1, 0x104($zero)
+    wram(0x0000'069Cu, 0x8C1A010Cu);   // [19] lw   $k0, 0x10C($zero)  (EPC)
+    wram(0x0000'06A0u, 0x8C1F0114u);   // [20] lw   $ra, 0x114($zero)  (fills $k0 load-delay slot)
+    wram(0x0000'06A4u, 0x03400008u);   // [21] jr   $k0  ($k0 loaded 2 insns ago — valid)
+    wram(0x0000'06A8u, 0x42000010u);   // [22] rfe  [delay slot — restores SR exception bits]
+
     std::fprintf(stdout, "[PSX-EXE] PC=0x%08X GP=0x%08X loaded '%s'\n",
                  info.pc, info.gp, path);
     return info;
@@ -580,6 +700,9 @@ void Bus::tick(u32 cycles) noexcept {
 
     // ── Root counters (sys clock, dotclock, sys/8) ────────────────────────────
     timers_->tick(cycles);
+
+    // ── CD-ROM response delays ────────────────────────────────────────────────
+    cdrom_->tick(cycles);
 
     // ── VBlank timing ─────────────────────────────────────────────────────────
     vblank_cycles_ += cycles;

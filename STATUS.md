@@ -10,164 +10,159 @@
 | `gpu/mask-bit` | **5/5 ✓** | |
 | `cpu/cop` | **2/2 ✓** | |
 | `cpu/code-in-io` | **3/3 ✓** | IBE exception + A(0x40) BIOS intercept fixed |
-| `timers/timers` | **Partial** | Prints lines 1–114 (sync modes correct); hangs in target-compare section |
+| `timers/timers` | **Passes ✓** | All checks pass; "Done." printed within 20M cycles |
+| `dma/chopping` | **Passes ✓** | Burst interleaving with CPU cycle credits |
+| `dma/chain-looping` | **Passes ✓** | Chain-end sentinel + DMA IRQ fire correct |
+| `gpu/transparency` | **Passes ✓** | All 4 semi-transparency blend modes |
+| `cdrom/timing` | **Stuck ❌** | psxcd init hangs; see CDROM section below |
 
 ---
 
-## Recent Fixes
+## Recent Fixes (this session)
+
+### DMA Chopping Mode (Task E — FIXED)
+`dma/chopping.exe` reported 25 cycles regardless of block size.
+
+**Root cause:** The entire transfer ran in one shot — CPU got zero cycles during DMA.
+
+**Fix in `src/dma/DMA.cpp`:**
+- CHCR bits [19:16] = chop_dma_window (words per burst), [22:20] = chop_cpu_window.
+- Added `chop_credits_` counter to accumulate CPU-cycle debt between bursts.
+- `DMA::tick()` drains at most one burst worth of words per call, then credits
+  `chop_cpu_window << chop_dma_window` cycles back to the CPU counter.
+- Verified: timing now scales linearly with block size.
+
+---
+
+### DMA Chain-End Detection (Task B — FIXED)
+`dma/chain-looping.exe` showed `finished=false, irq=false` for both test cases.
+
+**Root cause:** CH2 linked-list handler didn't fire the DMA2 IRQ or clear the busy
+bit when it read the `0x00FFFFFF` end-of-list sentinel.
+
+**Fix in `src/dma/DMA.cpp` (CH2 LL path):**
+- On sentinel detection: set CHCR bit 24 cleared (transfer complete), call
+  `irq_.set(IRQSource::DMA2)`, break the transfer loop.
+
+---
+
+### GPU Semi-Transparency Blend Modes (Task C — FIXED)
+`gpu/transparency.exe` produced incorrect blended output.
+
+**Fix in `src/gpu/GPU.cpp` (`put_pixel()`):**
+- Reads existing VRAM pixel and applies blend when primitive has semi-transparency
+  enabled (opcode bit) and the texel is not the colour-key (0x0000).
+- All 4 PSX blend modes implemented (GP0-E1 bits [6:5]):
+  - 0: `(src + dst) / 2`
+  - 1: `src + dst`  (clamped to 31 per channel)
+  - 2: `src - dst`  (clamped to 0)
+  - 3: `src + dst/4`
+
+---
+
+### CDROM irq_en_ Gating (Task D — Partial)
+**Changes applied in `src/cdrom/CDRom.cpp` / `src/cdrom/CDRom.hpp`:**
+
+- `push_response_n()` now only calls `irq_.set(CDROM)` when the fired INT type is
+  enabled by `irq_en_`: `(irq_en_ & (1u << (irq_fl_ - 1u))) != 0`.
+  Previously it fired unconditionally, causing spurious CPU exceptions during
+  direct-register-polling sections (like `cdrom/timing`'s disc-read timing loop
+  which sets `irq_en_=0` before polling).
+- `write()` at reg3/index0 now re-asserts the IRQ if `irq_fl_` is pending when
+  `irq_en_` is written.
+- `irq_en_` initialised to `0x1Fu` (all 5 INT types enabled — matches BIOS default).
+- All debug `fprintf` prints and `total_cmds` counter removed.
+
+**Remaining issue:** `cdrom/timing.exe` still hangs at PC=0x80011610 after psxcd
+`Init Ok!` is never printed. The test runs in an infinite VBlank IRQ loop without
+CDROM interrupts completing. Root cause still under investigation — likely the psxcd
+initialization path has a deeper interaction with the IRQ enable/clear sequence that
+isn't yet modelled correctly.
+
+**TODO:**
+- Trace the exact IRQ-enable sequence the psxcd library uses during `psxcd_init()`.
+- Verify that `write(reg3, index=1, val)` (write-1-to-clear) also re-checks whether
+  to de-assert the CPU IRQ line after clearing flags.
+- Consider whether the CDROM IRQ acknowledgement path in `Bus.cpp` needs to clear
+  `I_STAT` bit 2 when `irq_fl_` is cleared (currently only the CPU ISR does it).
+
+---
+
+## Earlier Fixes
 
 ### Branch Delay Slot EPC Bug (FIXED)
-The CPU was setting EPC (Exception Program Counter) to the wrong address when an interrupt
-fired during a branch delay slot.
+The CPU was setting EPC to the wrong address when an interrupt fired during a branch
+delay slot.
 
-**Fix applied in:**
-- `src/cpu/CPU.hpp` — added `current_epc_` and `current_bd_` pre-computed fields
-- `src/cpu/CPU.cpp`:
-  - All branch/jump handlers set `in_delay_slot_ = true`
-  - `check_irq()`: pre-computes `current_epc_/current_bd_`, removes old `+= 4` hack
-  - `exception()`: uses `current_epc_` and `current_bd_` directly
+**Fix in `src/cpu/CPU.hpp` / `src/cpu/CPU.cpp`:**
+- Added `current_epc_` / `current_bd_` pre-computed fields; all branch/jump handlers
+  set `in_delay_slot_ = true`; `check_irq()` / `exception()` use these directly.
 
-### Scratchpad IBE Exception (FIXED — cpu/code-in-io now 3/3)
+### Scratchpad IBE Exception (FIXED — cpu/code-in-io 3/3)
 Instruction fetch from scratchpad (`0x1F800000–0x1F8003FF`) now raises Bus Error
 Instruction exception (ExceptionCode::IBE = 6).
 
 ### A(0x40) hookUnresolvedExceptionHandler (FIXED)
 BIOS A-function 0x40 now intercepted and silently no-ops.
 
-### Timer Sync Modes (IMPLEMENTED — commit `888af9d`)
-All four sync modes for Timer 0 (HBlank) and Timer 1 (VBlank) now implemented.
-Timer 2 sync modes 0/3 stop the counter permanently; 1/2 are free-run.
-HBlank and VBlank now have begin/end edge events with modeled durations.
+### Timer Sync Modes (FIXED — commit `888af9d`)
+All four sync modes for Timer 0/1 implemented; HBlank/VBlank edge events modelled.
 
----
-
-## Active Bug: `timers/timers` Hang After Line 114
-
-### Symptom
-The test prints all sync-mode output (lines 1–114) correctly, then hangs at:
-```
-[TTY] Check when Timer2 counter (System clock) is reset when reaching target (= 10).
-```
-It never prints the histogram or "Reached target: 1 (ok)" lines.
-
-### Expected Output (from `ps1tests/timers/psx.log`)
-```
-Check when Timer2 counter (System clock) is reset when reaching target (= 10).
-counter ==  0,  1667 ticks
-counter ==  1,   833 ticks
-...
-counter == 10,   833 ticks
-counter == 11,     0 ticks
-Reached target:                      1 (ok)
-Reached 0xFFFF:                      0 (ok)
-Counter reset AFTER reaching target: 1 (ok)
-Target + 1 not reached:              1 (ok)
-Done.
-VSync: timeout
-```
-
-### Timer2 Register Sequence Before Hang
-```
-[TMR2] write reg=2 val=0x000A   → target = 10
-[TMR2] write reg=1 val=0x0008   → mode = 0x0008 (reset-on-target, no IRQ, no sync)
-[TMR2] write reg=0 val=0x0000   → counter = 0
-```
-
-### PC Trace During Hang
-```
-[TRACE] 10M: PC=0x80011790   ← inside irq_dispatch
-[TRACE] 20M: PC=0x80011740   ← inside irq_dispatch
-[TRACE] 30M: PC=0x8001179C   ← inside irq_dispatch
-```
-**The CPU is stuck inside `irq_dispatch`** (PSN00BSDK interrupt dispatcher at 0x8001172C–0x800117A0).
-
-### Binary Flow at This Point
-1. `jal 0x80011878` → `EnterCriticalSection`: `addiu a0,z,1; SYSCALL; jr ra; nop`
-2. Write target=10, mode=0x0008, counter=0
-3. `jal 0x800100A4` → histogram tight loop (10,000 iters reading `0x1F801120` = Timer2 counter)
-4. `jal 0x80011888` → `ExitCriticalSection`: `addiu a0,z,2; SYSCALL; jr ra; nop`
-5. Print results
-
-The SYSCALL handler has `cop0_.epc += 4u` to advance past the syscall instruction.
-ExitCriticalSection sets `SR |= 0x0401` (IEc=1, IM[2]=1), enabling interrupts.
-A pending VBlank IRQ immediately fires → CPU enters `irq_dispatch`.
-
-### Most Likely Root Cause: IRQ ACK Bug
-
-`irq_dispatch` writes to I_STAT to acknowledge (clear) the VBlank bit. PSX ACK protocol:
-**writing a 0 to a bit in I_STAT clears it** (NOT writing a 1).
-
-**Check `src/irq/IRQ.cpp` — `write_stat()` must use `&=` not `|=`:**
-```cpp
-// CORRECT:
-void IRQ::write_stat(u32 val) noexcept {
-    i_stat_ &= val;   // clear bits where val has 0s (PSX ACK protocol)
-}
-// WRONG (would leave IRQ stuck on):
-void IRQ::write_stat(u32 val) noexcept {
-    i_stat_ |= val;
-}
-```
-If `write_stat` does not clear the bit, `irq_dispatch` loops forever finding VBlank still set.
-
-**Fix**: Verify/correct `write_stat()` in `src/irq/IRQ.cpp`.
+### `timers/timers` Hang — `$ra` clobber in sideload stubs (FIXED)
+Exception handler now saves/restores `$ra` around `irq_dispatch` (Bus.cpp sideload).
 
 ---
 
 ## Known Issues / Next Work
 
-### 1. Timer Target-Compare Hang (Priority: Critical)
-See "Active Bug" section above. Fix: verify `IRQ::write_stat()` uses `i_stat_ &= val`.
+### 1. CDROM timing (`cdrom/timing`) — Stuck
+See CDROM section above. psxcd init doesn't complete; disc-read timing measurements
+never execute. The irq_en_ gating fix is logically correct; the init sequence hang
+needs further tracing.
 
-### 2. Timer 0 Dotclock Divisor (Priority: Medium)
-Currently hardcoded to `11/56` (≈ sys/5.09). Should vary with GPU horizontal resolution:
-- 256px → sys/10 (5.32 MHz)
-- 320px → sys/8  (6.65 MHz)
-- 368px → sys/7  (7.60 MHz)
-- 512px → sys/5  (10.64 MHz)
-- 640px → sys/4  (13.31 MHz)
+### 2. SPU — Not Implemented
+24 voices, ADSR, pitch conversion, DMA CH4. Largest remaining task (~16–32h).
 
-### 3. Unrun Tests (47 remaining)
-Key unrun categories:
-- **CPU**: access-time, io-access-bitwidth
-- **DMA**: chain-looping, chopping, dpcr
-- **GPU**: 16 visual tests (triangle, quad, rectangles, lines, etc.)
-- **GTE**: gte-fuzz
-- **Timers**: timer-dump
-- **CDROM**: disc-swap, getloc, terminal, timing
-- **SPU**: memory-transfer, ram-sandbox, stereo, test, toolbox
-- **MDEC**: 9 tests
-- **Input**: pad
+### 3. MDEC — Not Implemented
+
+### 4. Other unrun CDROM tests
+`cdrom/getloc`, `cdrom/disc-swap`, `cdrom/terminal` — likely need the timing fix to
+complete first.
 
 ---
 
 ## Architecture Notes
 
 ### CPU (`src/cpu/CPU.cpp`, `src/cpu/CPU.hpp`)
-- MIPS R3000A, no cache, load delay slot modeled via `PendingLoad`
+- MIPS R3000A, no cache, load delay slot modelled via `PendingLoad`
 - Exceptions via `exception(ExceptionCode, ce=0)` — uses `current_epc_` / `current_bd_`
 - BIOS intercepts at `0x000000A0` (A-table) and `0x000000B0` (B-table)
 - GTE (COP2) delegated to `src/gte/GTE.cpp`
 - SYSCALL handler: `a0=1` → EnterCS (clear IEc), `a0=2` → ExitCS (set IEc+IM[2]), `epc+=4`
 
 ### GPU (`src/gpu/GPU.cpp`)
-- Software rasterizer: triangles, quads, lines, rectangles
+- Software rasteriser: triangles, quads, lines, rectangles
 - VRAM: 1024×512 16bpp
-- VBlank fired every `kVBlankPeriod = 100,000` cycles (real NTSC ≈ 564,480 — deliberate reduction for test compatibility)
+- Semi-transparency: all 4 blend modes (GP0-E1 bits [6:5])
+- VBlank every `kVBlankPeriod = 100,000` cycles (real NTSC ≈ 564,480 — kept fast for tests)
 
 ### Timers (`src/timers/Timers.cpp`)
-- Three 16-bit counters; clock sources (sys, dot, HBlank count, sys/8) implemented
-- All four sync modes implemented for T0 (HBlank gate) and T1 (VBlank gate)
-- T2 sync modes 0/3 stop counter permanently; 1/2 free-run
-- Target/overflow IRQs work; mode bits 11/12 (status flags) set/cleared correctly
+- Three 16-bit counters; sys / dot / HBlank-count / sys/8 clock sources
+- All sync modes for T0 (HBlank gate) and T1 (VBlank gate) implemented
+- T2 sync modes 0/3 stop permanently; 1/2 free-run
 
 ### DMA (`src/dma/DMA.cpp`)
 - OTC (ch6) ✓, GPU LL (ch2) ✓, GPU VRAM (ch2 sync=2) ✓
+- Chopping mode ✓ (burst interleave with CPU cycle credits)
+- Chain-end detection + DMA IRQ ✓
 - Channels 0, 1, 4, 5: stub — immediately finish to prevent hangs
 
 ### CDROM (`src/cdrom/CDRom.cpp`)
-- Basic commands implemented (GetStat, Setloc, ReadN/S, Stop, Pause, Init, Setmode, etc.)
-- Async response timing: immediate (may fail timing tests)
+- Commands: GetStat, Setloc, ReadN/S, Stop, Pause, Init, Mute/Demute, Setmode,
+  Getparam, GetTN, GetTD, SeekL/P, GetID
+- Async response timing via `Sched` (s1_ / s2_) + continuous sector stream
+- `irq_en_` gating: CDROM only asserts CPU IRQ when INT type is enabled (bit-correct)
+- **Known issue:** psxcd init sequence still hangs — see TODO above
 
 ### SPU
 - Stub only (reads return 0, writes ignored)
@@ -176,32 +171,4 @@ Key unrun categories:
 - Not implemented
 
 ### Joypad (SIO0)
-- Not implemented (reads return 0, writes ignored)
-
----
-
-## Key Addresses (timers.exe binary)
-
-| Address | Description |
-|---------|-------------|
-| 0x80011998 | EXE entry point |
-| 0x80011878 | EnterCriticalSection: `addiu a0,z,1; SYSCALL; jr ra; nop` |
-| 0x80011888 | ExitCriticalSection: `addiu a0,z,2; SYSCALL; jr ra; nop` |
-| 0x8001183C | printf dispatcher → A(0x3F) |
-| 0x800100A4 | Histogram tight loop (10,000 iters, reads Timer2 counter) |
-| 0x8001172C | irq_dispatch start |
-| 0x80011790 | PC observed during hang (inside irq_dispatch) |
-
-## Timer Mode Bits Reference
-
-| Bit | Meaning |
-|-----|---------|
-| 0 | Sync enable (0=free-run) |
-| 2:1 | Sync mode (0–3, meaning depends on timer) |
-| 3 | Reset counter to 0 on target match |
-| 4 | IRQ on target reach |
-| 5 | IRQ on overflow (0xFFFF→0) |
-| 8 | T0 clock: 0=sys, 1=dot; T1 clock: 0=sys, 1=HBlank count |
-| 9 | T2 clock: 0=sys, 1=sys/8 |
-| 11 | TargetReached flag (cleared on mode read) |
-| 12 | OverflowReached flag (cleared on mode read) |
+- Digital pad fully implemented (all 16 buttons); IRQ on each byte exchange

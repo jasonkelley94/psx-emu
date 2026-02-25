@@ -57,15 +57,19 @@ public:
     // Called by DMA channel 3 to drain the sector data buffer word by word.
     [[nodiscard]] u32 read_data_word() noexcept;
 
+    // ── Timing tick ───────────────────────────────────────────────────────────
+    // Called from Bus::tick() to advance pending CDROM response delays.
+    void tick(u32 cycles) noexcept;
+
 private:
     IRQ& irq_;
 
     u8 index_  = 0;       // current register bank [1:0]
-    u8 irq_en_ = 0;       // IRQ enable mask [4:0]
+    u8 irq_en_ = 0x1Fu;   // IRQ enable mask [4:0] — BIOS leaves all 5 INT types enabled
     u8 irq_fl_ = 0;       // pending INT type [2:0]  (0 = none)
 
     // ── CD stat / mode ────────────────────────────────────────────────────────
-    u8 cd_stat_ = 0x10u;  // default: SHELL_OPEN; set to 0x02 after load_disc()
+    u8 cd_stat_ = 0x02u;  // default: motor on, disc present
     u8 mode_    = 0x20u;  // Setmode byte (0x20 = double-speed)
 
     // ── First response FIFO (up to 8 bytes) ───────────────────────────────────
@@ -73,11 +77,24 @@ private:
     u8            resp_len_     = 0;
     mutable u8    resp_pos_     = 0;   // mutable so read() can be const
 
-    // ── Deferred second response ───────────────────────────────────────────────
-    // Fired when the BIOS acknowledges the first INT by clearing irq_fl_.
-    std::array<u8, 8> resp2_{};
-    u8 resp2_len_  = 0;
-    u8 resp2_type_ = 0;
+    // ── Scheduled responses ───────────────────────────────────────────────────
+    // Instead of firing immediately, responses go through a delay countdown.
+    // s1_: first response (INT3/INT5); s2_: second response (INT2/INT1).
+    // s2_ starts counting down after s1_ fires.
+    struct Sched {
+        bool active = false;
+        u32  delay  = 0;
+        u8   type   = 0;
+        u8   len    = 0;
+        std::array<u8, 8> data{};
+    };
+    Sched s1_{};   // first pending response
+    Sched s2_{};   // second pending response (delay starts after s1 fires)
+
+    // ── Continuous sector stream (ReadN/ReadS) ────────────────────────────────
+    bool reading_   = false;   // true while drive is delivering sectors
+    u32  rd_delay_  = 0;       // cycles until next INT1 fires
+    u32  rd_period_ = 0;       // per-sector cycle count (speed-dependent)
 
     // ── Parameter FIFO (written before each command) ───────────────────────────
     std::array<u8, 8> params_{};
@@ -97,16 +114,16 @@ private:
     // ── Helpers ───────────────────────────────────────────────────────────────
     [[nodiscard]] u8 status() const noexcept;
 
-    // Push an N-byte first response and fire the CDRom IRQ.
+    // Fire a response immediately: store in resp_[] and assert CDRom IRQ.
     void push_response_n(u8 int_type, const u8* data, u32 len) noexcept;
 
-    // Convenience: push a single-byte response.
-    void push_response1(u8 int_type, u8 byte0) noexcept {
-        push_response_n(int_type, &byte0, 1u);
+    // Schedule first response with d1 cycle delay.
+    // Optionally schedule a second response with d2 cycle delay (from s1 fire).
+    void sched(u8 type1, const u8* d1, u32 l1, u32 delay1) noexcept;
+    void sched1(u8 type1, u8 byte1, u32 delay1) noexcept {
+        sched(type1, &byte1, 1u, delay1);
     }
-
-    // Queue a deferred N-byte second response (fired on INT3 acknowledge).
-    void defer_response_n(u8 int_type, const u8* data, u32 len) noexcept;
+    void sched2(u8 type2, const u8* d2, u32 l2, u32 delay2) noexcept;
 
     // Read 2048 bytes at seek_lba_ from the disc image into data_buf_.
     // Advances seek_lba_ by 1 on success.

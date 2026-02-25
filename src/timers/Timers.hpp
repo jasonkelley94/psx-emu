@@ -3,6 +3,7 @@
 #include <array>
 #include "common/Types.hpp"
 #include "irq/IRQ.hpp"
+#include "gpu/GPU.hpp"
 
 // ── Root Counters (Timers 0–2) ────────────────────────────────────────────────
 // Three 16-bit free-running counters in the I/O window:
@@ -50,7 +51,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 class Timers {
 public:
-    explicit Timers(IRQ& irq) noexcept : irq_(irq) {}
+    explicit Timers(IRQ& irq, const GPU& gpu) noexcept : irq_(irq), gpu_(gpu) {}
 
     // ── Bus interface (offset relative to IO_BASE + 0x100) ───────────────────
     [[nodiscard]] u32 read (u32 off) const noexcept;
@@ -68,7 +69,8 @@ public:
     void vblank_end()   noexcept;
 
 private:
-    IRQ& irq_;
+    IRQ&       irq_;
+    const GPU& gpu_;
 
     static constexpr IRQSource kSrc[3] = {
         IRQSource::TMR0, IRQSource::TMR1, IRQSource::TMR2

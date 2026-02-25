@@ -280,6 +280,58 @@ u16 GPU::vram_read_pixel() const noexcept {
     return px;
 }
 
+// ── Texture fetch ─────────────────────────────────────────────────────────────
+//
+// Applies texture window masking (GP0 E2), then indexes into VRAM using the
+// texture page base from GPUSTAT[4:0] and the current color depth (GPUSTAT[8:7]).
+//
+// Depth 0 — 4-bit CLUT: each VRAM 16-bit word holds 4 palette indices.
+// Depth 1 — 8-bit CLUT: each VRAM 16-bit word holds 2 palette indices.
+// Depth 2+ — 15-bit raw: each VRAM 16-bit word is one texel (RGB555).
+u16 GPU::fetch_texel(s32 u_raw, s32 v_raw) const noexcept {
+    // Texture window (E2): mask selects which coordinate bits are replaced
+    // by the offset bits.  Both fields are in units of 8 pixels.
+    const u32 win_mask_x = ((tex_window_ >>  0u) & 0x1Fu) * 8u;
+    const u32 win_mask_y = ((tex_window_ >>  5u) & 0x1Fu) * 8u;
+    const u32 win_off_x  = ((tex_window_ >> 10u) & 0x1Fu) * 8u;
+    const u32 win_off_y  = ((tex_window_ >> 15u) & 0x1Fu) * 8u;
+
+    // Wrap u/v to 8-bit then apply window.
+    const u32 u = static_cast<u32>(u_raw) & 0xFFu;
+    const u32 v = static_cast<u32>(v_raw) & 0xFFu;
+    const u32 ue = (u & ~win_mask_x) | (win_off_x & win_mask_x);
+    const u32 ve = (v & ~win_mask_y) | (win_off_y & win_mask_y);
+
+    // Texture page origin in VRAM.
+    const u32 tx_base = (gpustat_ & 0xFu) * 64u;        // X: [3:0] × 64 pixels
+    const u32 ty_base = ((gpustat_ >> 4u) & 1u) * 256u; // Y: bit4 × 256 pixels
+    const u32 depth   = (gpustat_ >> 7u) & 3u;
+
+    switch (depth) {
+    case 0: {  // 4-bit CLUT — 4 indices per 16-bit word
+        const u32 vx  = (tx_base + ue / 4u) & (VRAM_W - 1u);
+        const u32 vy  = (ty_base + ve)       & (VRAM_H - 1u);
+        const u16 raw = vram_[vy * VRAM_W + vx];
+        const u32 idx = (raw >> ((ue & 3u) * 4u)) & 0xFu;
+        return vram_[(clut_y_ & (VRAM_H - 1u)) * VRAM_W
+                   + ((clut_x_ + idx) & (VRAM_W - 1u))];
+    }
+    case 1: {  // 8-bit CLUT — 2 indices per 16-bit word
+        const u32 vx  = (tx_base + ue / 2u) & (VRAM_W - 1u);
+        const u32 vy  = (ty_base + ve)       & (VRAM_H - 1u);
+        const u16 raw = vram_[vy * VRAM_W + vx];
+        const u32 idx = (raw >> ((ue & 1u) * 8u)) & 0xFFu;
+        return vram_[(clut_y_ & (VRAM_H - 1u)) * VRAM_W
+                   + ((clut_x_ + idx) & (VRAM_W - 1u))];
+    }
+    default: {  // 15-bit raw (depth 2 or 3)
+        const u32 vx = (tx_base + ue) & (VRAM_W - 1u);
+        const u32 vy = (ty_base + ve) & (VRAM_H - 1u);
+        return vram_[vy * VRAM_W + vx];
+    }
+    }
+}
+
 // ── Coordinate helpers ────────────────────────────────────────────────────────
 
 // Sign-extend 11-bit X coordinate from bits [10:0] of a vertex word.
@@ -306,19 +358,83 @@ s32 GPU::off_y() const noexcept {
 
 // ── Rasterizer primitives ─────────────────────────────────────────────────────
 
-// Write one RGB555 pixel to VRAM, clipped to the current draw area.
+// Apply one of the four PSX semi-transparency blend modes.
+// mode is GPUSTAT[6:5]:  0: (B+F)/2  1: B+F  2: B-F  3: B+F/4
+// back is the existing VRAM pixel (RGB555); fr/fg/fb are the front 5-bit channels.
+// Returns the blended RGB555 (bit 15 = 0).
+static u16 blend_rgb(u32 mode, u16 back, u32 fr, u32 fg, u32 fb) noexcept {
+    const u32 br = (back >>  0u) & 0x1Fu;
+    const u32 bg = (back >>  5u) & 0x1Fu;
+    const u32 bb = (back >> 10u) & 0x1Fu;
+    u32 rr, rg, rb;
+    switch (mode) {
+    case 0:  // (B + F) / 2
+        rr = (br + fr) >> 1u;  rg = (bg + fg) >> 1u;  rb = (bb + fb) >> 1u;
+        break;
+    case 1:  // B + F, clamped to 31
+        rr = std::min(31u, br + fr);
+        rg = std::min(31u, bg + fg);
+        rb = std::min(31u, bb + fb);
+        break;
+    case 2:  // B - F, clamped to 0
+        rr = (br > fr) ? (br - fr) : 0u;
+        rg = (bg > fg) ? (bg - fg) : 0u;
+        rb = (bb > fb) ? (bb - fb) : 0u;
+        break;
+    default: // B + F/4, clamped to 31
+        rr = std::min(31u, br + (fr >> 2u));
+        rg = std::min(31u, bg + (fg >> 2u));
+        rb = std::min(31u, bb + (fb >> 2u));
+        break;
+    }
+    return static_cast<u16>(rr | (rg << 5u) | (rb << 10u));
+}
+
+// Write one RGB888 pixel (converted to RGB555) to VRAM, clipped to draw area.
+// If prim_semi_ is set, applies the semi-transparency blend mode from GPUSTAT[6:5].
 void GPU::put_pixel(s32 x, s32 y, u8 r, u8 g, u8 b) noexcept {
     if (x < da_x1() || x > da_x2() || y < da_y1() || y > da_y2()) return;
     if (x < 0 || x >= static_cast<s32>(VRAM_W)) return;
     if (y < 0 || y >= static_cast<s32>(VRAM_H)) return;
     const u32  idx        = static_cast<u32>(y) * VRAM_W + static_cast<u32>(x);
     const bool check_mask = (gpustat_ >> 12u) & 1u;
-    if (check_mask && (vram_[idx] & 0x8000u)) return;   // masked destination
+    if (check_mask && (vram_[idx] & 0x8000u)) return;
     const u16 mask_bit = ((gpustat_ >> 11u) & 1u) ? 0x8000u : 0u;
-    vram_[idx] = static_cast<u16>((static_cast<u32>(r) >> 3u)
-                                | ((static_cast<u32>(g) >> 3u) << 5u)
-                                | ((static_cast<u32>(b) >> 3u) << 10u)
-                                | mask_bit);
+    const u32 fr = static_cast<u32>(r) >> 3u;
+    const u32 fg = static_cast<u32>(g) >> 3u;
+    const u32 fb = static_cast<u32>(b) >> 3u;
+    u16 result;
+    if (prim_semi_) {
+        result = blend_rgb((gpustat_ >> 5u) & 3u, vram_[idx], fr, fg, fb);
+    } else {
+        result = static_cast<u16>(fr | (fg << 5u) | (fb << 10u));
+    }
+    vram_[idx] = result | mask_bit;
+}
+
+// Write one pre-built RGB555 texel to VRAM, clipped to draw area.
+// Bit 15 of the texel is the per-pixel semi-transparency flag: if prim_semi_ is
+// also set, this pixel is blended; otherwise it is drawn opaque.
+// The stored VRAM bit 15 is always taken from GPUSTAT[11] (mask-on-draw).
+void GPU::put_pixel(s32 x, s32 y, u16 rgb555) noexcept {
+    if (x < da_x1() || x > da_x2() || y < da_y1() || y > da_y2()) return;
+    if (x < 0 || x >= static_cast<s32>(VRAM_W)) return;
+    if (y < 0 || y >= static_cast<s32>(VRAM_H)) return;
+    const u32  idx        = static_cast<u32>(y) * VRAM_W + static_cast<u32>(x);
+    const bool check_mask = (gpustat_ >> 12u) & 1u;
+    if (check_mask && (vram_[idx] & 0x8000u)) return;
+    const u16 mask_bit = ((gpustat_ >> 11u) & 1u) ? 0x8000u : 0u;
+    u16 result;
+    if (prim_semi_ && (rgb555 & 0x8000u)) {
+        // Per-pixel semi-transparency: texel bit 15 set → apply blend.
+        const u32 fr = (rgb555 >>  0u) & 0x1Fu;
+        const u32 fg = (rgb555 >>  5u) & 0x1Fu;
+        const u32 fb = (rgb555 >> 10u) & 0x1Fu;
+        result = blend_rgb((gpustat_ >> 5u) & 3u, vram_[idx], fr, fg, fb);
+    } else {
+        result = rgb555 & 0x7FFFu;
+    }
+    vram_[idx] = result | mask_bit;
 }
 
 // Edge function: 2× signed area of the triangle (a, b, p).
@@ -331,9 +447,10 @@ static u8 clamp_u8(s32 v) noexcept {
     return static_cast<u8>(v < 0 ? 0 : v > 255 ? 255 : v);
 }
 
-// Edge-function (half-space) rasterizer with Gouraud color interpolation.
+// Edge-function (half-space) rasterizer with Gouraud color / texture interpolation.
 // Draw offset must already be incorporated into vertex coordinates before calling.
-void GPU::raster_tri(Vertex v0, Vertex v1, Vertex v2) noexcept {
+// textured=true: fetch texels via fetch_texel() and modulate with vertex color.
+void GPU::raster_tri(Vertex v0, Vertex v1, Vertex v2, bool textured) noexcept {
     // 2× signed area — used both for orientation test and barycentric division.
     const s32 area2 = edge_fn(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
     if (area2 == 0) return;  // degenerate (zero-area)
@@ -356,25 +473,69 @@ void GPU::raster_tri(Vertex v0, Vertex v1, Vertex v2) noexcept {
             if (area2 > 0 ? (w0 < 0 || w1 < 0 || w2 < 0)
                           : (w0 > 0 || w1 > 0 || w2 > 0)) continue;
 
-            // Barycentric color interpolation.
-            const u8 r = clamp_u8((v0.r * w0 + v1.r * w1 + v2.r * w2) / area2);
-            const u8 g = clamp_u8((v0.g * w0 + v1.g * w1 + v2.g * w2) / area2);
-            const u8 b = clamp_u8((v0.b * w0 + v1.b * w1 + v2.b * w2) / area2);
+            if (textured) {
+                // Barycentric UV interpolation.
+                const s32 ui = (v0.u * w0 + v1.u * w1 + v2.u * w2) / area2;
+                const s32 vi = (v0.v * w0 + v1.v * w1 + v2.v * w2) / area2;
+                const u16 texel = fetch_texel(ui, vi);
+                if (texel == 0u) continue;  // color-key transparent
 
-            put_pixel(px, py, r, g, b);
+                // Modulate: result = min(31, (texel_5bit × vertex_8bit) >> 7).
+                // vertex_color 0x80 = 128 is the neutral "no tint" value.
+                const s32 vr = clamp_u8((v0.r * w0 + v1.r * w1 + v2.r * w2) / area2);
+                const s32 vg = clamp_u8((v0.g * w0 + v1.g * w1 + v2.g * w2) / area2);
+                const s32 vb = clamp_u8((v0.b * w0 + v1.b * w1 + v2.b * w2) / area2);
+                const s32 tr = (texel >>  0u) & 0x1Fu;
+                const s32 tg = (texel >>  5u) & 0x1Fu;
+                const s32 tb = (texel >> 10u) & 0x1Fu;
+                const s32 fr = std::min(31, (tr * vr) >> 7);
+                const s32 fg = std::min(31, (tg * vg) >> 7);
+                const s32 fb = std::min(31, (tb * vb) >> 7);
+                // Preserve texel bit 15 (per-pixel semi-transparency flag).
+                put_pixel(px, py,
+                          static_cast<u16>(fr | (fg << 5) | (fb << 10)
+                                           | (texel & 0x8000u)));
+            } else {
+                // Barycentric color interpolation (flat or Gouraud).
+                const u8 r = clamp_u8((v0.r * w0 + v1.r * w1 + v2.r * w2) / area2);
+                const u8 g = clamp_u8((v0.g * w0 + v1.g * w1 + v2.g * w2) / area2);
+                const u8 b = clamp_u8((v0.b * w0 + v1.b * w1 + v2.b * w2) / area2);
+                put_pixel(px, py, r, g, b);
+            }
         }
     }
 }
 
-// Axis-aligned filled rectangle (flat color), clipped to draw area.
-void GPU::raster_rect(s32 x, s32 y, s32 w, s32 h, u8 r, u8 g, u8 b) noexcept {
-    const s32 x0 = std::max(x,     da_x1());
-    const s32 y0 = std::max(y,     da_y1());
+// Axis-aligned filled rectangle, clipped to draw area.
+// u_org/v_org: 8-bit UV at top-left before clipping; u_org == -1 → untextured.
+void GPU::raster_rect(s32 x, s32 y, s32 w, s32 h,
+                      u8 r, u8 g, u8 b,
+                      s32 u_org, s32 v_org) noexcept {
+    const bool textured = u_org >= 0;
+    const s32 x0 = std::max(x,         da_x1());
+    const s32 y0 = std::max(y,         da_y1());
     const s32 x1 = std::min(x + w - 1, da_x2());
     const s32 y1 = std::min(y + h - 1, da_y2());
     for (s32 ry = y0; ry <= y1; ++ry) {
         for (s32 rx = x0; rx <= x1; ++rx) {
-            put_pixel(rx, ry, r, g, b);
+            if (textured) {
+                const s32 ui = (u_org + (rx - x)) & 0xFF;
+                const s32 vi = (v_org + (ry - y)) & 0xFF;
+                const u16 texel = fetch_texel(ui, vi);
+                if (texel == 0u) continue;  // color-key transparent
+                // Modulate texel with vertex color.
+                const s32 tr = (texel >>  0u) & 0x1Fu;
+                const s32 tg = (texel >>  5u) & 0x1Fu;
+                const s32 tb = (texel >> 10u) & 0x1Fu;
+                const s32 fr = std::min(31, (tr * static_cast<s32>(r)) >> 7);
+                const s32 fg = std::min(31, (tg * static_cast<s32>(g)) >> 7);
+                const s32 fb = std::min(31, (tb * static_cast<s32>(b)) >> 7);
+                // Preserve texel bit 15 (per-pixel semi-transparency flag).
+                put_pixel(rx, ry, static_cast<u16>(fr | (fg << 5) | (fb << 10)
+                                                   | (texel & 0x8000u)));
+            } else {
+                put_pixel(rx, ry, r, g, b);
+            }
         }
     }
 }
@@ -409,11 +570,14 @@ void GPU::raster_line(Vertex v0, Vertex v1) noexcept {
 //   bit 4: 0=flat color, 1=Gouraud shading
 //   bit 3: 0=triangle,   1=quad (4 vertices)
 //   bit 2: 0=untextured, 1=textured
-//   bit 1: 0=opaque,     1=semi-transparent  (not yet implemented)
+//   bit 1: 0=opaque,     1=semi-transparent  (blend not yet implemented)
 //
-// For textured variants the FIFO contains extra CLUT and texture-page words;
-// those words are consumed correctly (kGP0Len table accounts for them) but
-// texture lookup is deferred — we rasterize using the vertex/command color.
+// Flat textured triangle FIFO layout (7 words, stride=2):
+//   [0]=cmd+color  [1]=v0_xy  [2]=clut|uv0  [3]=v1_xy  [4]=tpage|uv1
+//   [5]=v2_xy      [6]=uv2
+// Gouraud textured triangle (9 words, step=3):
+//   [0]=c0  [1]=v0_xy  [2]=clut|uv0  [3]=c1  [4]=v1_xy  [5]=tpage|uv1
+//   [6]=c2  [7]=v2_xy  [8]=uv2
 //
 // Line command byte (0x40–0x5F):
 //   bit 4: 0=flat, 1=Gouraud
@@ -421,20 +585,42 @@ void GPU::raster_line(Vertex v0, Vertex v1) noexcept {
 //
 // Sprite/rect command byte (0x60–0x7F):
 //   bits [4:3]: size  00=variable, 01=1×1, 10=8×8, 11=16×16
-//   bit 2:      0=untextured, 1=textured (texcoord word consumed, color used)
+//   bit 2:      0=untextured, 1=textured
+// Textured variable rect FIFO: [0]=cmd+color  [1]=xy  [2]=clut|uv  [3]=size
+// Textured fixed  rect FIFO:   [0]=cmd+color  [1]=xy  [2]=clut|uv
 void GPU::dispatch_draw(u32 cmd) noexcept {
     const s32 ox = off_x();
     const s32 oy = off_y();
 
     // Helper: decode a Vertex from a color word + coordinate word.
+    // u and v are initialised to 0; callers set them for textured commands.
     auto make_v = [&](u32 color_word, u32 coord_word) -> Vertex {
         return Vertex{
             sx11(coord_word) + ox,
             sy11(coord_word) + oy,
             static_cast<s32>((color_word >>  0u) & 0xFFu),
             static_cast<s32>((color_word >>  8u) & 0xFFu),
-            static_cast<s32>((color_word >> 16u) & 0xFFu)
+            static_cast<s32>((color_word >> 16u) & 0xFFu),
+            0, 0  // u, v — populated below for textured commands
         };
+    };
+
+    // Helper: update GPUSTAT texture page bits and clut_x_/clut_y_ from a
+    // polygon's in-FIFO tpage/CLUT attribute words.
+    // tpage_word: fifo word whose upper 16 bits are the texture-page attribute.
+    // clut_word:  fifo word whose upper 16 bits are the CLUT attribute.
+    auto apply_texattr = [&](u32 tpage_word, u32 clut_word) {
+        const u32 tpage = tpage_word >> 16u;
+        // Polygon texpage only updates GPUSTAT[8:0] (bits 9–10 are E1-only).
+        constexpr u32 kClear = 0x1FFu | (1u << 15u);
+        u32 ns = (gpustat_ & ~kClear) | (tpage & 0x1FFu) | kReadyMask;
+        if (allow_texture_disable_)
+            ns = (ns & ~(1u << 15u)) | (((tpage >> 11u) & 1u) << 15u);
+        gpustat_ = ns;
+
+        const u32 ca = clut_word >> 16u;
+        clut_x_ = (ca & 0x3Fu) * 16u;
+        clut_y_ = (ca >> 6u) & 0x1FFu;
     };
 
     // ── Polygons (0x20–0x3F) ─────────────────────────────────────────────────
@@ -442,62 +628,64 @@ void GPU::dispatch_draw(u32 cmd) noexcept {
         const bool gouraud  = (cmd & 0x10u) != 0u;
         const bool quad     = (cmd & 0x08u) != 0u;
         const bool textured = (cmd & 0x04u) != 0u;
+        prim_semi_          = (cmd & 0x02u) != 0u;
 
         if (!gouraud) {
             // Flat-shaded: one color for all vertices (from fifo_[0]).
-            // Textured flat triangle:  fifo_ = [cmd+col, v0, clut, v1, tpage, v2, uv2] — 7 words
-            // Textured flat quad:      fifo_ = [cmd+col, v0, clut, v1, tpage, v2, uv2, v3, uv3] — 9 words
-            // Coordinate indices (stride=2 for textured):
-            //   untextured tri:  v at 1,2,3
-            //   textured tri:    v at 1,3,5   tpage at fifo_[4]  (base+stride*1+1)
-            //   untextured quad: v at 1,2,3,4
-            //   textured quad:   v at 1,3,5,7 tpage at fifo_[4]
+            // Coordinate slot for vertex n: base + stride*n  (stride 2 if textured)
+            // UV+CLUT/tpage slot for vertex n: base + stride*n + 1
             const u32 stride = textured ? 2u : 1u;
             const u32 base   = 1u;
-            const Vertex v0 = make_v(fifo_[0], fifo_[base + stride * 0u]);
-            const Vertex v1 = make_v(fifo_[0], fifo_[base + stride * 1u]);
-            const Vertex v2 = make_v(fifo_[0], fifo_[base + stride * 2u]);
+            Vertex v0 = make_v(fifo_[0], fifo_[base + stride * 0u]);
+            Vertex v1 = make_v(fifo_[0], fifo_[base + stride * 1u]);
+            Vertex v2 = make_v(fifo_[0], fifo_[base + stride * 2u]);
             if (textured) {
-                // tpage is in bits [31:16] of the UV+tpage word at fifo_[4]
-                const u32 tpage = fifo_[base + stride * 1u + 1u] >> 16u;
-                // Polygon texpage only updates GPUSTAT[8:0]; bits 10:9 (dither,
-                // draw-to-display) are read-write only via explicit GP0(E1).
-                constexpr u32 kClear = 0x1FFu | (1u << 15u);
-                u32 ns = (gpustat_ & ~kClear) | (tpage & 0x1FFu) | kReadyMask;
-                if (allow_texture_disable_)
-                    ns = (ns & ~(1u << 15u)) | (((tpage >> 11u) & 1u) << 15u);
-                gpustat_ = ns;
+                // fifo_[2] = CLUT|UV0,  fifo_[4] = TPAGE|UV1,  fifo_[6] = UV2
+                apply_texattr(fifo_[base + stride * 1u + 1u],  // tpage at slot 4
+                              fifo_[base + stride * 0u + 1u]); // clut  at slot 2
+                v0.u = static_cast<s32>(fifo_[base + stride*0u + 1u] & 0xFFu);
+                v0.v = static_cast<s32>((fifo_[base + stride*0u + 1u] >> 8u) & 0xFFu);
+                v1.u = static_cast<s32>(fifo_[base + stride*1u + 1u] & 0xFFu);
+                v1.v = static_cast<s32>((fifo_[base + stride*1u + 1u] >> 8u) & 0xFFu);
+                v2.u = static_cast<s32>(fifo_[base + stride*2u + 1u] & 0xFFu);
+                v2.v = static_cast<s32>((fifo_[base + stride*2u + 1u] >> 8u) & 0xFFu);
             }
-            raster_tri(v0, v1, v2);
+            raster_tri(v0, v1, v2, textured);
             if (quad) {
-                const Vertex v3 = make_v(fifo_[0], fifo_[base + stride * 3u]);
-                raster_tri(v1, v2, v3);
+                Vertex v3 = make_v(fifo_[0], fifo_[base + stride * 3u]);
+                if (textured) {
+                    v3.u = static_cast<s32>(fifo_[base + stride*3u + 1u] & 0xFFu);
+                    v3.v = static_cast<s32>((fifo_[base + stride*3u + 1u] >> 8u) & 0xFFu);
+                }
+                raster_tri(v1, v2, v3, textured);
             }
         } else {
-            // Gouraud-shaded: each vertex has its own color word immediately
-            // before its coordinate word.
-            // Untextured Gouraud tri:  [cmd+c0, v0, c1, v1, c2, v2]
-            // Textured Gouraud tri:    [cmd+c0, v0, clut+uv0, c1, v1, tpage+uv1, c2, v2, uv2]
-            //   color at 0,3,6 / coord at 1,4,7 / tpage at 5
-            // Untextured Gouraud quad: color 0,2,4,6 / coord 1,3,5,7
-            // Textured Gouraud quad:   color 0,3,6,9 / coord 1,4,7,10 / tpage at 5
+            // Gouraud-shaded: each vertex has its own color word.
+            // Untextured: color/coord pairs (step=2).
+            // Textured:   color/coord/uv triples (step=3).
+            //   CLUT at fifo_[2], tpage at fifo_[step+2]=fifo_[5].
             const u32 step = textured ? 3u : 2u;
-            const Vertex v0 = make_v(fifo_[0u],          fifo_[1u]);
-            const Vertex v1 = make_v(fifo_[step],        fifo_[step + 1u]);
-            const Vertex v2 = make_v(fifo_[step * 2u],  fifo_[step * 2u + 1u]);
+            Vertex v0 = make_v(fifo_[0u],        fifo_[1u]);
+            Vertex v1 = make_v(fifo_[step],      fifo_[step + 1u]);
+            Vertex v2 = make_v(fifo_[step * 2u], fifo_[step * 2u + 1u]);
             if (textured) {
-                // tpage in bits [31:16] of fifo_[step + 2] = fifo_[5]
-                const u32 tpage = fifo_[step + 2u] >> 16u;
-                constexpr u32 kClear = 0x1FFu | (1u << 15u);
-                u32 ns = (gpustat_ & ~kClear) | (tpage & 0x1FFu) | kReadyMask;
-                if (allow_texture_disable_)
-                    ns = (ns & ~(1u << 15u)) | (((tpage >> 11u) & 1u) << 15u);
-                gpustat_ = ns;
+                apply_texattr(fifo_[step + 2u],  // tpage at fifo_[5]
+                              fifo_[2u]);         // clut  at fifo_[2]
+                v0.u = static_cast<s32>(fifo_[2u] & 0xFFu);
+                v0.v = static_cast<s32>((fifo_[2u] >> 8u) & 0xFFu);
+                v1.u = static_cast<s32>(fifo_[step + 2u] & 0xFFu);
+                v1.v = static_cast<s32>((fifo_[step + 2u] >> 8u) & 0xFFu);
+                v2.u = static_cast<s32>(fifo_[step*2u + 2u] & 0xFFu);
+                v2.v = static_cast<s32>((fifo_[step*2u + 2u] >> 8u) & 0xFFu);
             }
-            raster_tri(v0, v1, v2);
+            raster_tri(v0, v1, v2, textured);
             if (quad) {
-                const Vertex v3 = make_v(fifo_[step * 3u], fifo_[step * 3u + 1u]);
-                raster_tri(v1, v2, v3);
+                Vertex v3 = make_v(fifo_[step * 3u], fifo_[step * 3u + 1u]);
+                if (textured) {
+                    v3.u = static_cast<s32>(fifo_[step*3u + 2u] & 0xFFu);
+                    v3.v = static_cast<s32>((fifo_[step*3u + 2u] >> 8u) & 0xFFu);
+                }
+                raster_tri(v1, v2, v3, textured);
             }
         }
         return;
@@ -507,6 +695,7 @@ void GPU::dispatch_draw(u32 cmd) noexcept {
     if (cmd >= 0x40u && cmd <= 0x5Fu) {
         const bool gouraud  = (cmd & 0x10u) != 0u;
         const bool polyline = (cmd & 0x08u) != 0u;
+        prim_semi_          = (cmd & 0x02u) != 0u;
 
         if (!polyline) {
             // Single segment.
@@ -522,10 +711,7 @@ void GPU::dispatch_draw(u32 cmd) noexcept {
                 raster_line(v0, v1);
             }
         } else {
-            // Poly-line: fifo_len_ vertices, terminated by 0x5... sentinel.
-            // The sentinel was detected during FIFO accumulation and fifo_len_
-            // was reset; at dispatch time fifo_len_ == 0 so we can't walk it.
-            // Walk fifo_[] up to FIFO_CAP; terminate on a 0x5... word or end.
+            // Poly-line: terminated by a 0x5... sentinel word.
             if (!gouraud) {
                 // fifo_: [cmd+col, v0, v1, v2, ... , 0x5...]
                 Vertex prev = make_v(fifo_[0], fifo_[1]);
@@ -556,15 +742,24 @@ void GPU::dispatch_draw(u32 cmd) noexcept {
         const u32 b = (fifo_[0] >> 16u) & 0xFFu;
         const s32 x = sx11(fifo_[1]) + ox;
         const s32 y = sy11(fifo_[1]) + oy;
+        const bool textured = (cmd & 0x04u) != 0u;
+        prim_semi_          = (cmd & 0x02u) != 0u;
+
+        // Extract CLUT and UV origin for textured sprites.
+        s32 u_org = -1, v_org = 0;
+        if (textured) {
+            const u32 ca = fifo_[2] >> 16u;
+            clut_x_ = (ca & 0x3Fu) * 16u;
+            clut_y_ = (ca >> 6u) & 0x1FFu;
+            u_org = static_cast<s32>(fifo_[2] & 0xFFu);
+            v_org = static_cast<s32>((fifo_[2] >> 8u) & 0xFFu);
+        }
 
         // Size: bits [4:3] of cmd  — 00=variable, 01=1×1, 10=8×8, 11=16×16
         const u32 size_bits = (cmd >> 3u) & 3u;
         s32 w, h;
         if (size_bits == 0u) {
-            // Variable: fifo_[2] holds W[15:0] + H[31:16]
-            // (For textured variants fifo_[2] is the texcoord; fifo_[3] is size —
-            // but we ignore textures, so treat fifo_[2] as size for untextured.)
-            const bool textured = (cmd & 0x04u) != 0u;
+            // Variable: fifo_[2] is texcoord (textured) or size (untextured).
             const u32 size_word = textured ? fifo_[3] : fifo_[2];
             w = static_cast<s32>( size_word        & 0xFFFFu);
             h = static_cast<s32>((size_word >> 16u) & 0xFFFFu);
@@ -575,7 +770,8 @@ void GPU::dispatch_draw(u32 cmd) noexcept {
             w = h = dim;
         }
         raster_rect(x, y, w, h,
-                    static_cast<u8>(r), static_cast<u8>(g), static_cast<u8>(b));
+                    static_cast<u8>(r), static_cast<u8>(g), static_cast<u8>(b),
+                    u_org, v_org);
     }
 }
 
@@ -597,6 +793,8 @@ void GPU::gp1(u32 value) noexcept {
         ctvr_cy_              = ctvr_h_;   // deactivate CPU→VRAM (cy >= h)
         vtcr_active_          = false;
         allow_texture_disable_ = false;
+        clut_x_               = 0;
+        clut_y_               = 0;
         break;
 
     case 0x01:          // Reset command buffer

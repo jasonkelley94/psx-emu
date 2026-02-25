@@ -22,7 +22,6 @@ void Timers::write(u32 off, u32 value) noexcept {
     const u32 n   = (off >> 4u) & 3u;
     const u32 reg = (off >> 2u) & 3u;
     if (n >= 3u) return;
-    if (n == 2) std::fprintf(stderr, "[TMR2] write reg=%u val=0x%04X\n", reg, value);
     switch (reg) {
     case 0:  tmr_[n].counter = value & 0xFFFFu; break;
     case 1:
@@ -93,9 +92,12 @@ void Timers::tick(u32 cycles) noexcept {
 
         if (run) {
             if ((t.mode >> 8u) & 1u) {
-                dot_frac_ += cycles * 11u;
-                const u32 ticks = dot_frac_ / 56u;
-                dot_frac_ %= 56u;
+                // Dotclock source: one dot per (sys / divisor) system cycles.
+                // Divisor is read from the GPU's current horizontal resolution.
+                const u32 div = gpu_.dot_divisor();
+                dot_frac_ += cycles;
+                const u32 ticks = dot_frac_ / div;
+                dot_frac_ %= div;
                 advance(0, ticks);
             } else {
                 advance(0, cycles);
