@@ -9,7 +9,8 @@ Bus::Bus(std::unique_ptr<Bios> bios)
     , cdrom_ (std::make_unique<CDRom>(*irq_))
     , timers_(std::make_unique<Timers>(*irq_, *gpu_))
       // DMA constructed last — it holds non-owning references to the above.
-    , dma_   (std::make_unique<DMA>(*ram_, *gpu_, *irq_, *cdrom_))
+    , dma_   (std::make_unique<DMA>(*ram_, *gpu_, *irq_, *cdrom_,
+                                    spu_ram_.data(), spu_transfer_addr_))
 {
     mc_format();  // pre-load an empty formatted memory card
 }
@@ -104,8 +105,21 @@ u32 Bus::io_read32(u32 phys) const noexcept {
     // Backed by spu_regs_[] so that writes are preserved on read-back.
     // This lets code-in-io's testCodeInSPU write jr-$ra to 0x1F801C00, then
     // execute from that address and return without a bus error.
-    // SPUSTAT (0xDAA): bit 10 (busy) and bits [5:0] match SPUCNT so BIOS init
-    // loop terminates — these read as 0 until a real write sets them.
+    //
+    // SPUSTAT (0x1F801DAE, off=0xDAE) bits[5:0] must mirror SPUCNT (0x1F801DAA)
+    // bits[5:0].  The BIOS init loop polls SPUSTAT after writing SPUCNT and hangs
+    // if they never match.  SPUSTAT is the high halfword of the word at off=0xDAC;
+    // SPUCNT is the high halfword of the word at off=0xDA8.
+    if (off == 0xDACu) {
+        u32 spucnt_word = 0u, stat_word = 0u;
+        std::memcpy(&spucnt_word, spu_regs_.data() + (0xDA8u - 0xC00u), sizeof(u32));
+        std::memcpy(&stat_word,   spu_regs_.data() + (0xDACu - 0xC00u), sizeof(u32));
+        const u16 spucnt  = static_cast<u16>(spucnt_word >> 16u);
+        const u16 spustat = static_cast<u16>((stat_word >> 16u) & 0xFFC0u)
+                          | static_cast<u16>(spucnt & 0x3Fu);
+        return (stat_word & 0x0000'FFFFu) | (static_cast<u32>(spustat) << 16u);
+    }
+
     if (off >= 0xC00u && off < 0xE80u) {
         const u32 idx = off - 0xC00u;
         u32 v = 0u;
@@ -210,6 +224,17 @@ void Bus::io_write16(u32 phys, u16 value) noexcept {
     if (off >= 0xC00u && off < 0xE80u) {
         const u32 idx = off - 0xC00u;
         std::memcpy(spu_regs_.data() + idx, &value, sizeof(u16));
+        // SPUADDR (0x1F801DA6): set SPU RAM transfer byte address = value × 8
+        if (off == 0xDA6u) {
+            spu_transfer_addr_ = static_cast<u32>(value) * 8u;
+        }
+        // SPUDATA (0x1F801DA8): PIO halfword write — store to SPU RAM, advance by 2
+        else if (off == 0xDA8u) {
+            const u32 sa = spu_transfer_addr_ & (spu_ram_.size() - 1u);
+            spu_ram_[sa]      = static_cast<u8>(value);
+            spu_ram_[sa + 1u] = static_cast<u8>(value >> 8u);
+            spu_transfer_addr_ = (spu_transfer_addr_ + 2u) & (spu_ram_.size() - 1u);
+        }
         return;
     }
 

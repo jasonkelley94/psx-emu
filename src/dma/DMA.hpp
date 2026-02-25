@@ -55,8 +55,12 @@
 // ──────────────────────────────────────────────────────────────────────────────
 class DMA {
 public:
-    DMA(Ram& ram, GPU& gpu, IRQ& irq, CDRom& cdrom) noexcept
-        : ram_(ram), gpu_(gpu), irq_(irq), cdrom_(cdrom) {}
+    // spu_ram  : pointer to Bus's 512 KB SPU RAM buffer (non-owning).
+    // spu_addr : pointer to Bus's SPU RAM transfer-address variable.
+    DMA(Ram& ram, GPU& gpu, IRQ& irq, CDRom& cdrom,
+        u8* spu_ram, u32& spu_addr) noexcept
+        : ram_(ram), gpu_(gpu), irq_(irq), cdrom_(cdrom)
+        , spu_ram_(spu_ram), spu_addr_(spu_addr) {}
 
     // ── Bus interface (offset from DMA base = IO_BASE + 0x080) ───────────────
     [[nodiscard]] u32  read (u32 off) const noexcept;
@@ -75,6 +79,12 @@ private:
     // DPCR default enables all channels with ascending priority (ch0 lowest).
     u32 dpcr_ = 0x07654321u;
     u32 dicr_ = 0u;
+
+    // SPU RAM: 512 KB sound buffer.  Non-owning pointer into Bus's spu_ram_.
+    // spu_addr_: current SPU RAM byte write position for DMA ch4.
+    static constexpr u32 SPU_RAM_SIZE = 512u * 1024u;
+    u8*  spu_ram_  = nullptr;
+    u32& spu_addr_;
 
     // ── References — DMA does not own these ───────────────────────────────────
     Ram&   ram_;
@@ -95,6 +105,7 @@ private:
     void run_gpu_block (u32 n) noexcept;  // ch2, mode 0/1: block to GP0
     void run_vram_read (u32 n) noexcept;  // ch2, mode 0/1: GPU→RAM VRAM readback
     void run_cdrom     (u32 n) noexcept;  // ch3: CD-ROM sector data → RAM
+    void run_spu       (u32 n) noexcept;  // ch4: main RAM ↔ SPU RAM
 
     // Called after any transfer completes — updates CHCR, DICR, and IRQ.
     void finish(u32 n) noexcept;

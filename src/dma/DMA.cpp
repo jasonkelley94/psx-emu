@@ -82,8 +82,11 @@ void DMA::write(u32 off, u32 value) noexcept {
         // Modes 1 and 2 start on busy alone (device sync'd or linked-list).
         // Exception: GPU→RAM (ch2, dir=1) uses hardware DREQ from the GPU which
         // is implicitly asserted when armed for VRAM readback — no bit 28 needed.
+        // Exception: SPU (ch4) asserts DREQ whenever SPUCNT enables DMA mode —
+        // games rely on this to trigger burst transfers without setting bit 28.
         const bool gpu_dreq = (n == 2u) && (ch_[n].chcr & 1u);
-        const bool should_run = busy && (sync != 0 || trigger || gpu_dreq);
+        const bool spu_dreq = (n == 4u);
+        const bool should_run = busy && (sync != 0 || trigger || gpu_dreq || spu_dreq);
 
         if (should_run && channel_enabled(n)) {
             start_transfer(n);
@@ -109,6 +112,10 @@ void DMA::start_transfer(u32 n) noexcept {
         // DMA ch1 destination RAM is zero-initialized, so the BIOS reads black
         // pixels for the boot animation and continues without hanging.
         finish(n);
+        break;
+
+    case 4:  // SPU — copy words between main RAM and 512 KB SPU RAM
+        run_spu(n);
         break;
 
     case 2:  // GPU
@@ -369,6 +376,57 @@ void DMA::run_cdrom(u32 n) noexcept {
     for (u32 i = 0u; i < total; ++i) {
         ram_.write<u32>(addr & (Ram::SIZE - 1u), cdrom_.read_data_word());
         addr = (addr + 4u) & 0x00FF'FFFFu;
+    }
+
+    finish(n);
+}
+
+// ── ch4: SPU RAM DMA (main RAM ↔ SPU RAM) ────────────────────────────────────
+// Mode 0 (burst):  BCR[15:0]              = word count (0 → 0x10000)
+// Mode 1 (slice):  BCR[31:16] × BCR[15:0] = total word count
+// Direction: CHCR bit 0 — 0 = main RAM → SPU RAM, 1 = SPU RAM → main RAM
+// spu_addr_ (= Bus::spu_transfer_addr_) is preset by a write to SPUADDR
+// (0x1F801DA6) and auto-increments by 4 bytes per word transferred.
+void DMA::run_spu(u32 n) noexcept {
+    const u32 dir  = ch_[n].chcr & 1u;
+    const u32 sync = (ch_[n].chcr >> 9u) & 3u;
+
+    u32 total;
+    if (sync == 1u) {
+        const u32 bs = ch_[n].bcr & 0xFFFFu;
+        const u32 ba = (ch_[n].bcr >> 16u) & 0xFFFFu;
+        total = bs * ba;
+    } else {
+        total = ch_[n].bcr & 0xFFFFu;
+        if (total == 0u) total = 0x1'0000u;
+    }
+
+    u32 ram_addr = ch_[n].madr & 0x00FF'FFFFu;
+
+    if (dir == 0u) {
+        // Main RAM → SPU RAM
+        for (u32 i = 0u; i < total; ++i) {
+            const u32 data = ram_.read<u32>(ram_addr & (Ram::SIZE - 1u));
+            const u32 sa   = spu_addr_ & (SPU_RAM_SIZE - 1u);
+            spu_ram_[sa + 0u] = static_cast<u8>(data >>  0u);
+            spu_ram_[sa + 1u] = static_cast<u8>(data >>  8u);
+            spu_ram_[sa + 2u] = static_cast<u8>(data >> 16u);
+            spu_ram_[sa + 3u] = static_cast<u8>(data >> 24u);
+            ram_addr  = (ram_addr  + 4u) & 0x00FF'FFFFu;
+            spu_addr_ = (spu_addr_ + 4u) & (SPU_RAM_SIZE - 1u);
+        }
+    } else {
+        // SPU RAM → Main RAM
+        for (u32 i = 0u; i < total; ++i) {
+            const u32 sa   = spu_addr_ & (SPU_RAM_SIZE - 1u);
+            const u32 data = static_cast<u32>(spu_ram_[sa + 0u])
+                           | (static_cast<u32>(spu_ram_[sa + 1u]) <<  8u)
+                           | (static_cast<u32>(spu_ram_[sa + 2u]) << 16u)
+                           | (static_cast<u32>(spu_ram_[sa + 3u]) << 24u);
+            ram_.write<u32>(ram_addr & (Ram::SIZE - 1u), data);
+            ram_addr  = (ram_addr  + 4u) & 0x00FF'FFFFu;
+            spu_addr_ = (spu_addr_ + 4u) & (SPU_RAM_SIZE - 1u);
+        }
     }
 
     finish(n);

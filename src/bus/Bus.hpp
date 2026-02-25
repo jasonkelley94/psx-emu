@@ -81,7 +81,14 @@ private:
     std::unique_ptr<IRQ>   irq_;
     std::unique_ptr<CDRom>   cdrom_;    // after irq_ (holds irq_ reference)
     std::unique_ptr<Timers>  timers_;   // after irq_
-    std::unique_ptr<DMA>     dma_;      // last (needs ram_, gpu_, irq_)
+
+    // SPU RAM — 512 KB audio sample buffer shared with DMA ch4.
+    // Declared before dma_ so it is initialised before the DMA constructor
+    // takes a non-owning pointer/reference into this storage.
+    std::array<u8, 512u * 1024u> spu_ram_{};
+    u32 spu_transfer_addr_ = 0u;
+
+    std::unique_ptr<DMA>     dma_;      // last (needs ram_, gpu_, irq_, spu_ram_)
 
     // Scratchpad — 1 KiB fast SRAM (modelled as D-cache on real hardware)
     std::array<u8, PSX::SCRATCH_SIZE> scratch_{};
