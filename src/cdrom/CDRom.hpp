@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdio>
+#include <vector>
 #include "common/Types.hpp"
 #include "irq/IRQ.hpp"
 
@@ -42,7 +43,7 @@
 class CDRom {
 public:
     explicit CDRom(IRQ& irq) noexcept : irq_(irq) {}
-    ~CDRom() noexcept { if (disc_) std::fclose(disc_); }
+    ~CDRom() noexcept { for (auto* f : disc_files_) std::fclose(f); }
 
     // ── Bus interface: byte-wide reads/writes at offsets 0–3 ─────────────────
     [[nodiscard]] u8 read (u32 off) const noexcept;   // const: resp_pos_ mutable
@@ -100,9 +101,20 @@ private:
     std::array<u8, 8> params_{};
     u8 param_len_ = 0;
 
-    // ── Disc image ─────────────────────────────────────────────────────────────
-    std::FILE* disc_     = nullptr;
-    bool       disc_bin_ = false;    // true = 2352 B/sector BIN; false = ISO 2048
+    // ── CUE/BIN multi-track disc ───────────────────────────────────────────────
+    struct CdTrack {
+        int        number    = 0;
+        bool       audio     = false;
+        u32        sect_size = 2352u;  // raw bytes per sector on disc
+        u32        user_skip = 24u;    // bytes before 2048-byte user data block
+        int32_t    disc_lba  = 0;      // disc LBA of INDEX 01 (0 = first user sector)
+        long       file_off  = 0;      // byte offset in fh to INDEX 01 sector of this track
+        std::FILE* fh        = nullptr; // non-owning; owned by disc_files_
+    };
+    std::vector<CdTrack>    disc_tracks_;         // sorted by disc_lba ascending
+    std::vector<std::FILE*> disc_files_;          // all open file handles (owned)
+    int32_t                 lead_out_lba_ = 0;    // disc LBA of lead-out (for GetTD 0xAA)
+
     int32_t    seek_lba_ = 0;        // target LBA saved by Setloc (signed: negative = lead-in)
 
     // ── Head position tracking (for GetlocL / GetlocP) ─────────────────────────
@@ -119,6 +131,12 @@ private:
 
     // ── Helpers ───────────────────────────────────────────────────────────────
     [[nodiscard]] u8 status() const noexcept;
+
+    // Parse a .cue file and populate disc_tracks_ / disc_files_ / lead_out_lba_.
+    bool load_cue(const char* path) noexcept;
+
+    // Return the track that contains disc LBA lba (last track with disc_lba <= lba).
+    [[nodiscard]] const CdTrack* find_track(int32_t lba) const noexcept;
 
     // Fire a response immediately: store in resp_[] and assert CDRom IRQ.
     void push_response_n(u8 int_type, const u8* data, u32 len) noexcept;

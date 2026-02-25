@@ -65,7 +65,7 @@ int main(int argc, char* argv[]) {
 
     if (positional == 0) {
         std::fprintf(stderr,
-            "Usage: psx_emu [--headless] [--cycles N] <bios.bin|test.exe> [disc.bin|disc.iso]\n");
+            "Usage: psx_emu [--headless] [--cycles N] <bios.bin|test.exe> [disc.bin|disc.iso|disc.cue]\n");
         return EXIT_FAILURE;
     }
 

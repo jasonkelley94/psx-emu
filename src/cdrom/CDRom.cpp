@@ -116,23 +116,200 @@ void CDRom::tick(u32 cycles) noexcept {
 
 // ── Load disc image ───────────────────────────────────────────────────────────
 bool CDRom::load_disc(const char* path) noexcept {
-    if (disc_) { std::fclose(disc_); disc_ = nullptr; }
+    // Close and clear any previously loaded disc.
+    for (auto* f : disc_files_) std::fclose(f);
+    disc_tracks_.clear();
+    disc_files_.clear();
+    lead_out_lba_ = 0;
 
-    disc_ = std::fopen(path, "rb");
-    if (!disc_) {
+    // .cue extension → full CUE sheet parser.
+    const char* dot = std::strrchr(path, '.');
+    if (dot && (std::strcmp(dot, ".cue") == 0 || std::strcmp(dot, ".CUE") == 0))
+        return load_cue(path);
+
+    // ── Bare BIN or ISO: synthesise a single-track disc entry ─────────────────
+    std::FILE* fh = std::fopen(path, "rb");
+    if (!fh) {
         std::fprintf(stderr, "[CDRom] cannot open '%s'\n", path);
         return false;
     }
+    std::fseek(fh, 0, SEEK_END);
+    const long sz = std::ftell(fh);
+    std::rewind(fh);
 
-    // Determine sector size from the file extension.
-    const char* dot = std::strrchr(path, '.');
-    disc_bin_ = dot &&
+    CdTrack ct{};
+    ct.number   = 1;
+    ct.audio    = false;
+    ct.fh       = fh;
+    ct.disc_lba = 0;
+    ct.file_off = 0;
+
+    const bool is_bin = dot &&
         (std::strcmp(dot, ".bin") == 0 || std::strcmp(dot, ".BIN") == 0);
+    if (is_bin) {
+        ct.sect_size  = 2352u;
+        ct.user_skip  = 24u;
+        lead_out_lba_ = static_cast<int32_t>(sz / 2352L);
+    } else {
+        ct.sect_size  = 2048u;
+        ct.user_skip  = 0u;
+        lead_out_lba_ = static_cast<int32_t>(sz / 2048L);
+    }
 
-    cd_stat_ = 0x02u;  // MOTOR_ON; disc present; no error; shell closed
-    std::fprintf(stdout, "[CDRom] loaded '%s' (%s format)\n",
-                 path, disc_bin_ ? "BIN/2352" : "ISO/2048");
+    disc_tracks_.push_back(ct);
+    disc_files_.push_back(fh);
+
+    cd_stat_ = 0x02u;
+    std::fprintf(stdout, "[CDRom] loaded '%s' (%s format, %d sectors)\n",
+                 path, is_bin ? "BIN/2352" : "ISO/2048", lead_out_lba_);
     return true;
+}
+
+// ── CUE sheet parser ──────────────────────────────────────────────────────────
+bool CDRom::load_cue(const char* cue_path) noexcept {
+    // Extract directory from cue_path so we can resolve relative BIN filenames.
+    char cue_dir[1024] = {};
+    const char* last_slash = std::strrchr(cue_path, '/');
+    if (last_slash) {
+        const size_t dlen = static_cast<size_t>(last_slash - cue_path + 1);
+        if (dlen < sizeof(cue_dir))
+            std::memcpy(cue_dir, cue_path, dlen);
+    }
+
+    std::FILE* cf = std::fopen(cue_path, "r");
+    if (!cf) {
+        std::fprintf(stderr, "[CDRom] cannot open CUE '%s'\n", cue_path);
+        return false;
+    }
+
+    // Intermediate structures: one per FILE / one per INDEX 01 line.
+    struct PFile  { std::FILE* fh; long sz; u32 sect_size; };
+    struct PTrack { int num; bool audio; u32 sect_size; u32 user_skip;
+                    int file_idx; u32 file_sector; };
+
+    std::vector<PFile>  pf;
+    std::vector<PTrack> pt;
+
+    char line[512];
+    int  cur_fi   = -1;       // index into pf for current FILE directive
+    int  cur_tnum = 1;
+    u32  cur_ss   = 2352u;
+    u32  cur_skip = 24u;
+    bool cur_aud  = false;
+
+    while (std::fgets(line, static_cast<int>(sizeof(line)), cf)) {
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;   // skip leading whitespace
+
+        if (std::strncmp(p, "FILE", 4) == 0) {
+            // FILE "filename" BINARY  — open the referenced BIN file.
+            const char* q1 = std::strchr(p, '"');
+            if (!q1) continue;
+            const char* q2 = std::strchr(q1 + 1, '"');
+            if (!q2) continue;
+            const size_t fl = static_cast<size_t>(q2 - q1 - 1);
+            char fname[480] = {};
+            if (fl >= sizeof(fname)) continue;
+            std::memcpy(fname, q1 + 1, fl);
+
+            char full[1024] = {};
+            std::snprintf(full, sizeof(full), "%s%s", cue_dir, fname);
+            std::FILE* fh = std::fopen(full, "rb");
+            if (!fh) fh = std::fopen(fname, "rb");  // last-resort: as-is
+            if (!fh) {
+                std::fprintf(stderr, "[CDRom] CUE: cannot open '%s'\n", full);
+                std::fclose(cf);
+                for (auto& f : pf) std::fclose(f.fh);
+                return false;
+            }
+            std::fseek(fh, 0, SEEK_END);
+            const long sz = std::ftell(fh);
+            std::rewind(fh);
+
+            pf.push_back({ fh, sz, 2352u });
+            cur_fi = static_cast<int>(pf.size()) - 1;
+
+        } else if (std::strncmp(p, "TRACK", 5) == 0) {
+            // TRACK nn MODE2/2352 | MODE1/2352 | MODE1/2048 | AUDIO
+            char mode[32] = {};
+            std::sscanf(p, "TRACK %d %31s", &cur_tnum, mode);
+            if      (std::strcmp(mode, "AUDIO")     == 0) { cur_aud=true;  cur_ss=2352u; cur_skip= 0u; }
+            else if (std::strcmp(mode, "MODE2/2352") == 0) { cur_aud=false; cur_ss=2352u; cur_skip=24u; }
+            else if (std::strcmp(mode, "MODE1/2352") == 0) { cur_aud=false; cur_ss=2352u; cur_skip=16u; }
+            else if (std::strcmp(mode, "MODE1/2048") == 0) { cur_aud=false; cur_ss=2048u; cur_skip= 0u; }
+            else                                           { cur_aud=false; cur_ss=2352u; cur_skip=24u; }
+
+        } else if (std::strncmp(p, "INDEX", 5) == 0) {
+            // INDEX nn MM:SS:FF — only INDEX 01 marks where track data starts.
+            int idx = 0;
+            u32 mm = 0, ss = 0, ff = 0;
+            if (std::sscanf(p, "INDEX %d %u:%u:%u", &idx, &mm, &ss, &ff) == 4
+                    && idx == 1 && cur_fi >= 0) {
+                const u32 fsect = (mm * 60u + ss) * 75u + ff;
+                pt.push_back({ cur_tnum, cur_aud, cur_ss, cur_skip, cur_fi, fsect });
+                // Stamp the sect_size for this file (first track in file wins).
+                if (pf[static_cast<size_t>(cur_fi)].sect_size == 2352u)
+                    pf[static_cast<size_t>(cur_fi)].sect_size = cur_ss;
+            }
+        }
+    }
+    std::fclose(cf);
+
+    if (pt.empty()) {
+        std::fprintf(stderr, "[CDRom] CUE: no INDEX 01 entries found in '%s'\n", cue_path);
+        for (auto& f : pf) std::fclose(f.fh);
+        return false;
+    }
+
+    // ── Compute cumulative disc-sector offset at the start of each file ───────
+    // file_base[i] = total disc sectors before file i begins.
+    std::vector<int32_t> file_base(pf.size(), 0);
+    for (size_t i = 1; i < pf.size(); ++i)
+        file_base[i] = file_base[i-1]
+            + static_cast<int32_t>(pf[i-1].sz / static_cast<long>(pf[i-1].sect_size));
+
+    // disc_lba 0 = INDEX 01 of the first track in the first file.
+    const int32_t origin = file_base[static_cast<size_t>(pt[0].file_idx)]
+                           + static_cast<int32_t>(pt[0].file_sector);
+
+    // ── Populate disc_tracks_ and disc_files_ ─────────────────────────────────
+    for (auto& f : pf) disc_files_.push_back(f.fh);
+
+    for (auto& t : pt) {
+        CdTrack ct{};
+        ct.number    = t.num;
+        ct.audio     = t.audio;
+        ct.sect_size = t.sect_size;
+        ct.user_skip = t.user_skip;
+        ct.disc_lba  = file_base[static_cast<size_t>(t.file_idx)]
+                       + static_cast<int32_t>(t.file_sector) - origin;
+        ct.file_off  = static_cast<long>(t.file_sector) * static_cast<long>(t.sect_size);
+        ct.fh        = pf[static_cast<size_t>(t.file_idx)].fh;
+        disc_tracks_.push_back(ct);
+    }
+
+    // ── Lead-out: one-past-end of the last file on disc ───────────────────────
+    lead_out_lba_ = file_base.back()
+                    + static_cast<int32_t>(pf.back().sz
+                                           / static_cast<long>(pf.back().sect_size))
+                    - origin;
+
+    cd_stat_ = 0x02u;
+    std::fprintf(stdout, "[CDRom] CUE '%s': %zu track(s), lead-out LBA %d\n",
+                 cue_path, disc_tracks_.size(), lead_out_lba_);
+    return true;
+}
+
+// ── Find the track containing disc LBA lba ────────────────────────────────────
+const CDRom::CdTrack* CDRom::find_track(int32_t lba) const noexcept {
+    // disc_tracks_ is sorted by disc_lba ascending.  Return the last entry
+    // whose disc_lba <= lba (i.e. the track the head is currently inside).
+    const CdTrack* best = nullptr;
+    for (const auto& t : disc_tracks_) {
+        if (t.disc_lba <= lba) best = &t;
+        else break;
+    }
+    return best;
 }
 
 // ── BCD / MSF helpers ─────────────────────────────────────────────────────────
@@ -152,7 +329,7 @@ static void lba_to_abs_msf(int32_t lba, u8& mm, u8& ss, u8& ff) noexcept {
 
 // ── Read 2048 bytes at seek_lba_ into data_buf_ ───────────────────────────────
 bool CDRom::read_sector() noexcept {
-    if (!disc_) {
+    if (disc_tracks_.empty()) {
         // No disc image: fill with zeroed dummy data so timing tests can proceed.
         data_buf_.fill(0u);
         data_pos_   = 0u;
@@ -165,15 +342,32 @@ bool CDRom::read_sector() noexcept {
         return true;
     }
 
-    // BIN: 2352 B/sector; user data begins 24 bytes into each sector.
-    // ISO: 2048 B/sector; data is contiguous from the sector start.
-    const long off = disc_bin_
-        ? static_cast<long>(seek_lba_) * 2352L + 24L
-        : static_cast<long>(seek_lba_) * 2048L;
+    const CdTrack* t = find_track(seek_lba_);
+    if (!t) {
+        // LBA before the first track (lead-in); return zeros.
+        data_buf_.fill(0u);
+        data_pos_   = 0u;
+        data_ready_ = true;
+        seek_lba_  += 1;
+        loc_lba_    = seek_lba_ - 1;
+        loc_valid_  = true;
+        pos_valid_  = true;
+        pos_lba_    = loc_lba_;
+        return true;
+    }
 
-    if (std::fseek(disc_, off, SEEK_SET) != 0) return false;
+    // Compute byte offset into the track's file:
+    //   file_off  = byte offset to INDEX 01 sector of this track
+    //   + (lba - disc_lba) sectors past the track start
+    //   + user_skip bytes of raw sector header to skip
+    const long off = t->file_off
+                   + static_cast<long>(seek_lba_ - t->disc_lba)
+                     * static_cast<long>(t->sect_size)
+                   + static_cast<long>(t->user_skip);
+
+    if (std::fseek(t->fh, off, SEEK_SET) != 0) return false;
     const u32 got = static_cast<u32>(
-        std::fread(data_buf_.data(), 1u, SECTOR_SIZE, disc_));
+        std::fread(data_buf_.data(), 1u, SECTOR_SIZE, t->fh));
     if (got < SECTOR_SIZE) return false;
 
     data_pos_   = 0u;
@@ -284,15 +478,45 @@ void CDRom::handle_command(u8 cmd) noexcept {
 
     // ── 0x13 GetTN — first and last track numbers (BCD) ──────────────────────
     case 0x13: {
-        const u8 r[3] = { cd_stat_, 0x01u, 0x01u };  // single-track disc
+        u8 first = 0x01u, last = 0x01u;
+        if (!disc_tracks_.empty()) {
+            first = to_bcd(static_cast<u32>(disc_tracks_.front().number));
+            last  = to_bcd(static_cast<u32>(disc_tracks_.back().number));
+        }
+        const u8 r[3] = { cd_stat_, first, last };
         sched(3u, r, 3u, kAck1);
         break;
     }
 
-    // ── 0x14 GetTD — track N start position (MSF) ────────────────────────────
+    // ── 0x14 GetTD — track N start position (minute:second in BCD) ───────────
     case 0x14: {
-        // Track 1 always starts at MSF 00:02:00 on the PSX (150-frame lead-in).
-        const u8 r[3] = { cd_stat_, 0x00u, 0x02u };
+        u8 mm = 0x00u, ss = 0x02u;  // default: track 1 at absolute MSF 00:02:00
+        if (!disc_tracks_.empty()) {
+            if (p0 == 0xAAu) {
+                // Track 0xAA = lead-out
+                const u32 f = static_cast<u32>(lead_out_lba_ + 150);
+                mm = to_bcd(f / (75u * 60u));
+                ss = to_bcd((f / 75u) % 60u);
+            } else {
+                const u32 tnum = from_bcd(p0);
+                bool found = false;
+                for (const auto& t : disc_tracks_) {
+                    if (t.number == static_cast<int>(tnum)) {
+                        const u32 f = static_cast<u32>(t.disc_lba + 150);
+                        mm = to_bcd(f / (75u * 60u));
+                        ss = to_bcd((f / 75u) % 60u);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    const u8 err[2] = { static_cast<u8>(cd_stat_ | 0x01u), 0x10u };
+                    sched(5u, err, 2u, kAck1);
+                    break;
+                }
+            }
+        }
+        const u8 r[3] = { cd_stat_, mm, ss };
         sched(3u, r, 3u, kAck1);
         break;
     }
@@ -354,16 +578,25 @@ void CDRom::handle_command(u8 cmd) noexcept {
             ass = to_bcd((abs_f / 75u) % 60u);
             aff = to_bcd(abs_f % 75u);
         }
-        // Compute relative MSF within track 1 (track 1 starts at LBA 0).
+        // Determine current track and compute relative MSF within it.
         u8 track, index, rmm, rss, rff;
         if (pos_lba_ >= 0) {
-            track = 0x01u;  index = 0x01u;  // in track data
-            const u32 rf = static_cast<u32>(pos_lba_);
+            // Scan track table for the track containing pos_lba_.
+            int32_t track_start = 0;
+            track = 0x01u;
+            for (const auto& t : disc_tracks_) {
+                if (t.disc_lba <= pos_lba_) {
+                    track = to_bcd(static_cast<u32>(t.number));
+                    track_start = t.disc_lba;
+                } else break;
+            }
+            index = 0x01u;  // in track data (past INDEX 01)
+            const u32 rf = static_cast<u32>(pos_lba_ - track_start);
             rmm = to_bcd(rf / (75u * 60u));
             rss = to_bcd((rf / 75u) % 60u);
             rff = to_bcd(rf % 75u);
         } else {
-            track = 0x01u;  index = 0x00u;  // in pregap
+            track = 0x01u;  index = 0x00u;  // in pregap before track 1
             const u32 pg = static_cast<u32>(-pos_lba_);  // frames before track start
             rmm = to_bcd(pg / (75u * 60u));
             rss = to_bcd((pg / 75u) % 60u);
