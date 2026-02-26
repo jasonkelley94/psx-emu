@@ -14,6 +14,9 @@ namespace {
 }
 
 Display::Display() {
+    // Force X11 driver explicitly for VMware compatibility
+    SDL_setenv("SDL_VIDEODRIVER", "x11", 1);
+
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "[Display] SDL_Init failed: %s\n", SDL_GetError());
         return;

@@ -21,7 +21,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-URL="https://github.com/JaCzekanski/ps1-tests/releases/latest/download/ps1-tests.zip"
+URL="https://github.com/JaCzekanski/ps1-tests/releases/latest/download/tests.zip"
 TMP_ZIP="$(mktemp /tmp/ps1-tests-XXXXXX.zip)"
 
 echo "Downloading ps1-tests from GitHub..."
