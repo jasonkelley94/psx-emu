@@ -49,6 +49,23 @@ The runner covers 11 automatable tests with TTY-based pass/fail detection.
 
 ---
 
+### Display — Black Window Fix (SDL_RenderSetLogicalSize Removed)
+
+**Root cause:** `Display::present()` called `SDL_RenderSetLogicalSize()` every frame
+to change the logical coordinate space to the active display size (e.g. 320×240).  On
+SDL 2.30.0 this per-frame logical-size change corrupted the renderer state, resulting in
+a completely black window even though VRAM contained correct rendered content (confirmed
+via headless `vram.ppm` dump: all 76,800 display-area pixels non-zero).
+
+**Fix (`src/display/Display.cpp`):**
+- Removed `SDL_RenderSetLogicalSize()` from both the constructor and `present()`.
+- `present()` now calls `SDL_GetRendererOutputSize()` to obtain physical window pixel
+  dimensions and passes an explicit `dstRect {0, 0, winW, winH}` to `SDL_RenderCopy`.
+  Without any logical size active, SDL render coordinates equal physical pixels and the
+  cropped VRAM region scales to fill the window correctly on every frame.
+
+---
+
 ### GPU Display Area — GP1(05) and GP1(07) Implemented
 
 **Root cause:** The SDL window always showed raw 1024×512 VRAM from (0,0), ignoring the
@@ -60,10 +77,9 @@ display range) were stubs that did nothing.
   private fields; added `disp_start_x()`, `disp_start_y()`, `disp_width()`,
   `disp_height()` public accessors.
 - `src/gpu/GPU.cpp`: `GP1(05)` stores display-start X/Y; `GP1(07)` stores vert range.
-- `src/display/Display.cpp`: `present()` now uses a source `SDL_Rect` cropped to the
-  GPU's active display area and calls `SDL_RenderSetLogicalSize()` for aspect-correct
-  scaling.  A 320×240 game at VRAM (0,16) now fills the window instead of appearing as
-  a tiny patch in the upper-left corner.
+- `src/display/Display.cpp`: `present()` uses a source `SDL_Rect` cropped to the GPU's
+  active display area.  A 320×240 game at VRAM (0,16) now fills the window instead of
+  appearing as a tiny patch in the upper-left corner.
 
 ---
 

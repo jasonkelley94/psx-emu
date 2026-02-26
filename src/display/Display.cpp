@@ -36,9 +36,8 @@ Display::Display() {
         return;
     }
 
-    // Scale texture to window size while keeping pixel-art sharp.
-    SDL_RenderSetLogicalSize(renderer_, kTexW, kTexH);
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");  // nearest-neighbor
+    // Nearest-neighbor scaling for pixel-art sharpness.
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
 
     texture_ = SDL_CreateTexture(
         renderer_,
@@ -104,8 +103,14 @@ void Display::present(const GPU& gpu) noexcept {
         static_cast<int>(gpu.disp_start_y()),
         dw, dh
     };
-    SDL_RenderSetLogicalSize(renderer_, dw, dh);  // aspect-correct scaling
+    // Scale to fill the full window using physical-pixel coordinates.
+    // SDL_RenderSetLogicalSize is intentionally NOT used here — it activates a
+    // logical coordinate system that conflicts with explicit dst rects and causes
+    // a black window on SDL 2.30.0 when changed per-frame.
+    int winW, winH;
+    SDL_GetRendererOutputSize(renderer_, &winW, &winH);
+    const SDL_Rect dstRect { 0, 0, winW, winH };
     SDL_RenderClear(renderer_);
-    SDL_RenderCopy(renderer_, texture_, &src, nullptr);
+    SDL_RenderCopy(renderer_, texture_, &src, &dstRect);
     SDL_RenderPresent(renderer_);
 }
