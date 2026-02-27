@@ -14,7 +14,7 @@ class Bus;
 // ── COP0 register file ────────────────────────────────────────────────────────
 struct COP0 {
     u32 badvaddr = 0;   // r8  — faulting virtual address
-    u32 sr       = 0;   // r12 — Status Register
+    u32 sr       = (1u << 22);   // r12 — Status Register (BEV=1 after reset)
     u32 cause    = 0;   // r13 — Cause of last exception
     u32 epc      = 0;   // r14 — Exception Program Counter
 
@@ -68,6 +68,7 @@ public:
     // ── Sideload initialisation (PS-EXE direct boot) ──────────────────────────
     void set_pc (u32 addr) noexcept { pc_ = addr; next_pc_ = addr + 4u; }
     void set_reg(u32 idx, u32 val) noexcept { if (idx != 0u) gpr_[idx] = val; }
+    void set_cop0_sr(u32 val) noexcept { cop0_.sr = val; }
 
 private:
     // ── Register file ─────────────────────────────────────────────────────────

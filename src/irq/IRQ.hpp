@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/Types.hpp"
+#include <cstdio>
 
 // ── Interrupt sources ─────────────────────────────────────────────────────────
 // I_STAT / I_MASK bit positions (0–10).
@@ -38,7 +39,14 @@ public:
     [[nodiscard]] u32  read_mask() const noexcept { return mask_; }
 
     // I_STAT write: semantics are write-0-to-clear (AND with written value).
-    void write_stat(u32 val) noexcept { stat_ &= val; }
+    void write_stat(u32 val) noexcept {
+        // DEBUG: count I_STAT writes that clear CDROM bit
+        if ((stat_ & 0x04u) && !(val & 0x04u)) {
+            ++cdrom_ack_count_;
+        }
+        stat_ &= val;
+    }
+    u32 cdrom_ack_count() const noexcept { return cdrom_ack_count_; }
 
     // I_MASK write: plain R/W, unused bits always read 0.
     void write_mask(u32 val) noexcept { mask_ = val & 0x7FFu; }
@@ -52,4 +60,5 @@ public:
 private:
     u32 stat_ = 0;   // I_STAT — set by hardware, cleared by software
     u32 mask_ = 0;   // I_MASK — written by software
+    u32 cdrom_ack_count_ = 0;  // DEBUG counter
 };

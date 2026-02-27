@@ -5,3 +5,5 @@ build/
 *.so
 .cache/
 tests/ps1-tests/
+*.bin
+games/

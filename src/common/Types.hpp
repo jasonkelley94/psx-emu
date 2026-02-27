@@ -57,7 +57,7 @@ inline constexpr u32 EXP2_SIZE    = 0x2000u;
 inline constexpr u32 BIOS_BASE    = 0x1FC0'0000;
 inline constexpr u32 BIOS_SIZE    = 512u * 1024u;          // 512 KiB
 
-inline constexpr u32 CACHE_CTL    = 0xFFFE'0000;           // cache-control register
+inline constexpr u32 CACHE_CTL    = 0xFFFE'0130;           // cache-control register
 
 // Reset vector (uncached BIOS entry point, KSEG1)
 inline constexpr u32 RESET_VECTOR = 0xBFC0'0000;

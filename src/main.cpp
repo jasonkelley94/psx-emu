@@ -92,6 +92,9 @@ int main(int argc, char* argv[]) {
         cpu->set_reg(28u, info.gp);
         // ps1-tests set SP=0 in the EXE header; supply the conventional default.
         cpu->set_reg(29u, info.sp ? info.sp : 0x801F'FFF0u);
+        // In sideload mode there is no BIOS to clear BEV, so exception vectors
+        // must point to RAM (0x80000080) rather than ROM (0xBFC00180).
+        cpu->set_cop0_sr(0u);
 
         // Default cycle budget for headless runs; interactive loop ignores it.
         if (headless && max_cycles == 0u) max_cycles = 20'000'000u;
@@ -136,6 +139,11 @@ int main(int argc, char* argv[]) {
             ++cycles;
             bus->tick();
 
+            // DEBUG: fine-grained trace between 195M-205M
+            if (cycles >= 195000000u && cycles <= 205000000u && cycles % 1000000u == 0u) {
+                std::fprintf(stderr, "[FINE] %lluM: PC=0x%08X\n",
+                             static_cast<unsigned long long>(cycles / 1000000u), cpu->pc());
+            }
             // PC frequency trace every 10M cycles
             if (cycles % 10000000u == 0u) {
                 if (cpu->pc() == trace_prev_pc) {
@@ -165,28 +173,76 @@ int main(int argc, char* argv[]) {
         }
 
         dump_vram_ppm(bus->gpu(), "vram.ppm");
+
+        // DEBUG: dump exception vector and handler
+        std::fprintf(stderr, "\n=== Exception vector 0x80000080-0x800000A0 ===\n");
+        for (u32 addr = 0x80000080u; addr < 0x800000A0u; addr += 4u) {
+            u32 insn = bus->read<u32>(addr);
+            std::fprintf(stderr, "  0x%08X: 0x%08X\n", addr, insn);
+        }
+        std::fprintf(stderr, "\n=== Handler 0x80000C70-0x80000DA0 ===\n");
+        for (u32 addr = 0x80000C70u; addr < 0x80000DA0u; addr += 4u) {
+            u32 insn = bus->read<u32>(addr);
+            std::fprintf(stderr, "  0x%08X: 0x%08X\n", addr, insn);
+        }
+        // DEBUG: dump instructions at the loop addresses
+        std::fprintf(stderr, "\n=== Code at 0x80058640-0x80058740 ===\n");
+        for (u32 addr = 0x80058640u; addr < 0x80058740u; addr += 4u) {
+            u32 insn = bus->read<u32>(addr);
+            std::fprintf(stderr, "  0x%08X: 0x%08X\n", addr, insn);
+        }
+        std::fprintf(stderr, "\n=== Code at 0x00000C80-0x00001000 ===\n");
+        for (u32 addr = 0x00000C80u; addr < 0x00001000u; addr += 4u) {
+            u32 insn = bus->read<u32>(addr);
+            std::fprintf(stderr, "  0x%08X: 0x%08X\n", addr, insn);
+        }
+
+        // DEBUG: dump ECB and BIOS event tables
+        {
+            u32 ecb_ptr = bus->read<u32>(0x80079C84u);
+            std::fprintf(stderr, "\n=== ECB pointer at 0x80079C84: 0x%08X ===\n", ecb_ptr);
+            if (ecb_ptr >= 0x80000000u && ecb_ptr < 0x80200000u) {
+                for (u32 i = 0; i < 16u; i += 4u) {
+                    std::fprintf(stderr, "  ECB[0x%02X] = 0x%08X\n", i,
+                                 bus->read<u32>(ecb_ptr + i));
+                }
+            }
+            // Dump the BIOS event table (at 0x8000B9B0 typically)
+            // BIOS stores event class/spec/mode/func at each entry
+            std::fprintf(stderr, "\n=== BIOS IRQ mask check ===\n");
+            std::fprintf(stderr, "  I_MASK = 0x%03X\n", bus->irq().read_mask());
+            std::fprintf(stderr, "  CDROM irq_en = 0x%02X irq_fl = 0x%02X\n",
+                         bus->cdrom().read(3u), 0u);  // index 0 → irq_en
+        }
+        std::fprintf(stderr, "[DEBUG] Total CDROM I_STAT acks: %u\n",
+                     bus->irq().cdrom_ack_count());
+        std::fprintf(stderr, "[DEBUG] Final I_STAT=0x%03X I_MASK=0x%03X pending=%d COP0_SR=0x%08X\n",
+                     bus->irq().read_stat(), bus->irq().read_mask(),
+                     bus->irq().irq_pending() ? 1 : 0, cpu->cop0().sr);
         std::fprintf(stdout, "Done (%llu cycles). Final PC=0x%08X\n",
                      static_cast<unsigned long long>(cycles), cpu->pc());
         return EXIT_SUCCESS;
     }
 
     // ── Interactive SDL run loop ──────────────────────────────────────────────
-    // Present the GPU framebuffer to the screen once per emulated VBlank (~60 Hz).
+    // Run one emulated frame (~564 480 CPU cycles ≈ 1/60 s) per iteration,
+    // then present the GPU framebuffer and poll SDL events.
     Display display;
 
     static constexpr uint64_t kVBlankPeriod = 564'480u;
-    uint64_t cycle_acc = 0u;
+    bool running = true;
 
-    while (display.poll_events()) {
-        if (!cpu->step()) {
-            std::fprintf(stderr, "CPU halted\n");
-            break;
+    while (running && display.poll_events()) {
+        bus->set_buttons(display.buttons());
+        for (uint64_t i = 0; i < kVBlankPeriod; ++i) {
+            if (!cpu->step()) {
+                std::fprintf(stderr, "CPU halted\n");
+                running = false;
+                break;
+            }
+            bus->tick();
         }
-        bus->tick();
-        if (++cycle_acc >= kVBlankPeriod) {
-            cycle_acc -= kVBlankPeriod;
-            display.present(bus->gpu());
-        }
+        display.present(bus->gpu());
     }
 
     std::fprintf(stdout, "Emulation stopped.\n");

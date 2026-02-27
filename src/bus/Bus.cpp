@@ -8,10 +8,12 @@ Bus::Bus(std::unique_ptr<Bios> bios)
     , irq_   (std::make_unique<IRQ>())
     , cdrom_ (std::make_unique<CDRom>(*irq_))
     , timers_(std::make_unique<Timers>(*irq_, *gpu_))
+    , spu_   (std::make_unique<SPU>(*irq_))
       // DMA constructed last — it holds non-owning references to the above.
     , dma_   (std::make_unique<DMA>(*ram_, *gpu_, *irq_, *cdrom_,
                                     spu_ram_.data(), spu_transfer_addr_))
 {
+    spu_->set_ram_ptr(spu_ram_.data(), &spu_transfer_addr_);
     mc_format();  // pre-load an empty formatted memory card
 }
 
@@ -81,19 +83,27 @@ u32 Bus::io_read32(u32 phys) const noexcept {
         return 0x0000'0005u;  // SIO1_STAT: TX ready, no RX
     }
     if (off >= 0x040u && off < 0x050u) {
+        u32 val = 0u;
         switch (off & ~0x3u) {
         case 0x040u: {  // JOY_DATA — consume and clear RX FIFO
-            const u8 v = joy_.rx_byte;
+            val = joy_.rx_byte;
             joy_.rx_ready = false;
-            return static_cast<u32>(v);
+            break;
         }
         case 0x044u:  // JOY_STAT
             // bit 0 TXRDY1 = 1, bit 2 TXRDY2 = 1, bit 1 RXFIFO, bit 7 ACKINPUT
             // ACKINPUT = 0 (ACK active/low) when RX data ready, 1 when idle.
-            return 0x00000005u | (joy_.rx_ready ? 0x00000002u : 0x00000080u);
+            val = 0x00000005u | (joy_.rx_ready ? 0x00000002u : 0x00000080u);
+            break;
         default:
-            return 0u;  // JOY_MODE, JOY_CTRL, JOY_BAUD
+            val = 0u;  // JOY_MODE, JOY_CTRL, JOY_BAUD
+            break;
         }
+        // DEBUG: trace joypad reads
+        { static int jr = 0;
+          if (++jr <= 50)
+              std::fprintf(stderr, "[JOY] read32 off=0x%03X val=0x%08X\n", off, val); }
+        return val;
     }
 
     // ── Memory control registers — ignored, return 0 ─────────────────────────
@@ -102,29 +112,8 @@ u32 Bus::io_read32(u32 phys) const noexcept {
     }
 
     // ── SPU (offsets 0xC00–0xE7F) ─────────────────────────────────────────────
-    // Backed by spu_regs_[] so that writes are preserved on read-back.
-    // This lets code-in-io's testCodeInSPU write jr-$ra to 0x1F801C00, then
-    // execute from that address and return without a bus error.
-    //
-    // SPUSTAT (0x1F801DAE, off=0xDAE) bits[5:0] must mirror SPUCNT (0x1F801DAA)
-    // bits[5:0].  The BIOS init loop polls SPUSTAT after writing SPUCNT and hangs
-    // if they never match.  SPUSTAT is the high halfword of the word at off=0xDAC;
-    // SPUCNT is the high halfword of the word at off=0xDA8.
-    if (off == 0xDACu) {
-        u32 spucnt_word = 0u, stat_word = 0u;
-        std::memcpy(&spucnt_word, spu_regs_.data() + (0xDA8u - 0xC00u), sizeof(u32));
-        std::memcpy(&stat_word,   spu_regs_.data() + (0xDACu - 0xC00u), sizeof(u32));
-        const u16 spucnt  = static_cast<u16>(spucnt_word >> 16u);
-        const u16 spustat = static_cast<u16>((stat_word >> 16u) & 0xFFC0u)
-                          | static_cast<u16>(spucnt & 0x3Fu);
-        return (stat_word & 0x0000'FFFFu) | (static_cast<u32>(spustat) << 16u);
-    }
-
     if (off >= 0xC00u && off < 0xE80u) {
-        const u32 idx = off - 0xC00u;
-        u32 v = 0u;
-        std::memcpy(&v, spu_regs_.data() + idx, sizeof(u32));
-        return v;
+        return spu_->read(off);
     }
 
     // ── MDEC (0x1F801820–0x1F801824) — status / control ──────────────────────
@@ -172,6 +161,10 @@ void Bus::io_write32(u32 phys, u32 value) noexcept {
 
     // ── Joypad / SIO0 (0x040–0x04F) ─────────────────────────────────────────
     if (off >= 0x040u && off < 0x060u) {
+        // DEBUG: trace joypad writes
+        { static int jw = 0;
+          if (++jw <= 50)
+              std::fprintf(stderr, "[JOY] write32 off=0x%03X val=0x%08X\n", off, value); }
         if (off == 0x040u) joy_data_write(static_cast<u8>(value));  // JOY_DATA
         if (off == 0x04Au) {  // JOY_CTRL: bit 6 (reset) clears both state machines
             if (value & (1u << 6u)) {
@@ -182,10 +175,9 @@ void Bus::io_write32(u32 phys, u32 value) noexcept {
         return;  // other SIO0/SIO1 writes silently ignored
     }
 
-    // ── SPU (0x1F80_1C00 – 0x1F80_1E7F) — register file, preserves writes ───
+    // ── SPU (0x1F80_1C00 – 0x1F80_1E7F) ────────────────────────────────────────
     if (off >= 0xC00u && off < 0xE80u) {
-        const u32 idx = off - 0xC00u;
-        std::memcpy(spu_regs_.data() + idx, &value, sizeof(u32));
+        spu_->write(off, value);
         return;
     }
 
@@ -206,6 +198,10 @@ void Bus::io_write32(u32 phys, u32 value) noexcept {
 void Bus::io_write16(u32 phys, u16 value) noexcept {
     const u32 off = phys - PSX::IO_BASE;
 
+    // ── Interrupt controller (16-bit writes) ────────────────────────────────
+    if (off == 0x070u) { irq_->write_stat(static_cast<u32>(value)); return; }
+    if (off == 0x074u) { irq_->write_mask(static_cast<u32>(value)); return; }
+
     // ── Timers (16-bit registers) ─────────────────────────────────────────────
     if (off >= 0x100u && off < 0x130u) {
         timers_->write(off - 0x100u, static_cast<u32>(value));
@@ -214,27 +210,20 @@ void Bus::io_write16(u32 phys, u16 value) noexcept {
 
     // ── Joypad / SIO0 (16-bit writes) ────────────────────────────────────────
     if (off >= 0x040u && off < 0x060u) {
+        // DEBUG: trace joypad 16-bit writes
+        { static int jw16 = 0;
+          if (++jw16 <= 50)
+              std::fprintf(stderr, "[JOY] write16 off=0x%03X val=0x%04X\n",
+                           off, static_cast<unsigned>(value)); }
         if (off == 0x04Au) {  // JOY_CTRL halfword write
             if (value & (1u << 6u)) { joy_.seq = 0u; joy_.rx_ready = false; }
         }
         return;
     }
 
-    // ── SPU (16-bit writes) — store into register file ───────────────────────
+    // ── SPU (16-bit writes) ─────────────────────────────────────────────────────
     if (off >= 0xC00u && off < 0xE80u) {
-        const u32 idx = off - 0xC00u;
-        std::memcpy(spu_regs_.data() + idx, &value, sizeof(u16));
-        // SPUADDR (0x1F801DA6): set SPU RAM transfer byte address = value × 8
-        if (off == 0xDA6u) {
-            spu_transfer_addr_ = static_cast<u32>(value) * 8u;
-        }
-        // SPUDATA (0x1F801DA8): PIO halfword write — store to SPU RAM, advance by 2
-        else if (off == 0xDA8u) {
-            const u32 sa = spu_transfer_addr_ & (spu_ram_.size() - 1u);
-            spu_ram_[sa]      = static_cast<u8>(value);
-            spu_ram_[sa + 1u] = static_cast<u8>(value >> 8u);
-            spu_transfer_addr_ = (spu_transfer_addr_ + 2u) & (spu_ram_.size() - 1u);
-        }
+        spu_->write(off, static_cast<u32>(value));
         return;
     }
 
@@ -280,9 +269,9 @@ void Bus::io_write8(u32 phys, u8 value) noexcept {
         return;
     }
 
-    // ── SPU (8-bit writes) — store into register file ────────────────────────
+    // ── SPU (8-bit writes) ──────────────────────────────────────────────────────
     if (off >= 0xC00u && off < 0xE80u) {
-        spu_regs_[off - 0xC00u] = value;
+        spu_->write(off, static_cast<u32>(value));
         return;
     }
 
@@ -887,6 +876,14 @@ void Bus::tick(u32 cycles) noexcept {
     // ── CD-ROM response delays ────────────────────────────────────────────────
     cdrom_->tick(cycles);
 
+    // ── SPU tick ─────────────────────────────────────────────────────────────
+    // SPU runs at 44.1kHz, not CPU speed. Tick at ~768 CPU cycles per sample.
+    spu_cycles_ += cycles;
+    if (spu_cycles_ >= 768u) {
+        spu_cycles_ -= 768u;
+        spu_->tick();
+    }
+
     // ── VBlank timing ─────────────────────────────────────────────────────────
     vblank_cycles_ += cycles;
     if (vblank_cycles_ >= kVBlankPeriod) {
@@ -897,6 +894,7 @@ void Bus::tick(u32 cycles) noexcept {
             irq_->set(IRQSource::VBlank);
             timers_->vblank_begin();
             gpu_->toggle_field();
+            spu_->mix(nullptr, SPU_SAMPLES_PER_FRAME);
         }
     }
     if (in_vblank_) {

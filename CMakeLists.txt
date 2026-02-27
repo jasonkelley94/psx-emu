@@ -23,6 +23,7 @@ add_executable(psx_emu
     src/gte/GTE.cpp
     src/cpu/CPU.cpp
     src/display/Display.cpp
+    src/spu/SPU.cpp
 )
 
 target_include_directories(psx_emu PRIVATE src)

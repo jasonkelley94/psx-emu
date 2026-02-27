@@ -1,6 +1,5 @@
 #pragma once
 
-#include <string_view>
 #include <SDL2/SDL.h>
 #include "gpu/GPU.hpp"
 
@@ -14,6 +13,7 @@
 // Usage:
 //   Display display;
 //   while (display.poll_events()) {
+//       bus.set_buttons(display.buttons());
 //       cpu.step();
 //       if (vblank_fired) display.present(bus.gpu());
 //   }
@@ -23,15 +23,20 @@ public:
     Display();
     ~Display();
 
-    // Process pending OS events.  Returns false when the user closes the window.
+    // Process pending OS events and sample input state.
+    // Returns false when the user closes the window.
     bool poll_events() noexcept;
+
+    // Current joypad button state (active-low: 0 = pressed, 1 = released).
+    [[nodiscard]] u16 buttons() const noexcept { return buttons_; }
 
     // Blit the GPU VRAM to the screen.  Called once per VBlank (~60 Hz).
     void present(const GPU& gpu) noexcept;
 
 private:
-    SDL_Window*   window_   = nullptr;
-    SDL_Renderer* renderer_ = nullptr;
-    // ARGB8888 streaming texture — uploaded every frame from the RGB555 VRAM.
-    SDL_Texture*  texture_  = nullptr;
+    SDL_Window*         window_     = nullptr;
+    SDL_Renderer*       renderer_   = nullptr;
+    SDL_Texture*        texture_    = nullptr;
+    SDL_GameController* controller_ = nullptr;
+    u16                 buttons_    = 0xFFFFu;  // all released
 };

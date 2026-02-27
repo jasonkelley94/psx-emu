@@ -31,28 +31,28 @@ void CPU::check_irq() noexcept {
         cop0_.cause &= ~(1u << 10);
     }
 
+    // DEBUG: detect when CDROM bit is in I_STAT but interrupt is blocked
+    {
+        static u32 cdrom_blocked = 0;
+        const u32 istat = bus_.irq_read_stat();
+        if (istat & 0x04u) {  // CDROM bit set
+            if (!cop0_.ie_current() || !(cop0_.sr & cop0_.cause & 0xFF00u)) {
+                ++cdrom_blocked;
+                if (cdrom_blocked <= 5u)
+                    std::fprintf(stderr, "[IRQ-DBG] CDROM in I_STAT but blocked: IEc=%u SR=0x%08X Cause=0x%08X PC=0x%08X\n",
+                                 cop0_.ie_current() ? 1u : 0u, cop0_.sr, cop0_.cause, pc_);
+            }
+        } else {
+            cdrom_blocked = 0;
+        }
+    }
+
     // Take the interrupt if all three conditions hold:
     //   1. IEc (global interrupt enable) is set
     //   2. The corresponding IM bit is set  (IM[2], bit 10)
     //   3. The corresponding IP bit is set  (IP[2], bit 10)
     // We check IM & IP with an 8-bit mask covering bits [15:8].
     if (cop0_.ie_current() && (cop0_.sr & cop0_.cause & 0xFF00u)) {
-        // Temporary debug: log IRQs around the hang point
-        static int irq_log_count = 0;
-        ++irq_log_count;
-        if (irq_log_count <= 5 || (irq_log_count >= 50 && irq_log_count <= 60)) {
-            std::fprintf(stderr, "[IRQ#%d] PC=0x%08X I_STAT=0x%04X I_MASK=0x%04X SR=0x%08X\n",
-                irq_log_count, pc_,
-                bus_.irq().read_stat(), bus_.irq().read_mask(), cop0_.sr);
-        }
-        if (irq_log_count == 60) {
-            std::fprintf(stderr, "[IRQ] ... (logging paused, resuming at #1000)\n");
-        }
-        if (irq_log_count >= 1000 && irq_log_count <= 1005) {
-            std::fprintf(stderr, "[IRQ#%d] PC=0x%08X I_STAT=0x%04X I_MASK=0x%04X SR=0x%08X\n",
-                irq_log_count, pc_,
-                bus_.irq().read_stat(), bus_.irq().read_mask(), cop0_.sr);
-        }
         // pc_ is the instruction that would have executed if no IRQ.
         // in_delay_slot_ (set by the previous execute()) tells us if pc_ is
         // in a branch delay slot: if so EPC = branch address = pc_ - 4, BD=1.
@@ -85,30 +85,40 @@ bool CPU::step() {
     // 2. Commit the previous cycle's deferred load.
     commit_load();
 
-    // ── BIOS A-function intercept ─────────────────────────────────────────────
-    // When the code does "addiu $t2, $zero, 0xA0; jr $t2; addiu $t1, $zero, N"
-    // PC lands on 0x0000_00A0.  Instead of executing our stub (jr $ra) we call
-    // the C++ implementation directly so sideloaded EXEs get TTY output.
-    if (pc_ == 0x0000'00A0u) {
-        bios_a_call(gpr_[9]);  // $t1 = function number
-        pc_      = gpr_[31];   // jr $ra — return to the original caller
-        next_pc_ = pc_ + 4u;
-        in_delay_slot_ = false;
-        return true;
-    }
-
-    // ── BIOS B-function intercept ─────────────────────────────────────────────
-    // When the code does "addiu $t2, $zero, 0xB0; jr $t2; addiu $t1, $zero, N"
-    // PC lands on 0x0000_00B0.  We handle selected B functions needed by tests.
-    // B(0x17/0x18/0x19) fall through to our RAM-patched B dispatcher.
-    if (pc_ == 0x0000'00B0u) {
-        const u32 fn = gpr_[9];  // $t1 = function number
-        if (fn != 0x17u && fn != 0x18u && fn != 0x19u) {
-            if (bios_b_call(fn)) {
-                pc_      = gpr_[31];
-                next_pc_ = pc_ + 4u;
-                in_delay_slot_ = false;
-                return true;
+    // ── BIOS function intercepts ────────────────────────────────────────────
+    // In sideload mode (no BIOS ROM), we intercept A/B vectors to provide
+    // TTY output, timer helpers, etc.  When a real BIOS is present, we only
+    // hook A(0x3F) printf for TTY capture and let the BIOS handle everything
+    // else natively.
+    if (bus_.has_bios()) {
+        // Real BIOS: no intercepts — let the BIOS handle all A/B/C functions
+        // natively.  TTY output comes from the BIOS's own SIO writes.
+        // DEBUG: trace B-function calls
+        if (pc_ == 0x0000'00B0u) {
+            static int bcalls = 0;
+            if (++bcalls <= 100)
+                std::fprintf(stderr, "[BIOS-B] fn=0x%02X ($t1=%u)\n",
+                             gpr_[9], gpr_[9]);
+        }
+    } else {
+        // Sideload mode: intercept all A functions.
+        if (pc_ == 0x0000'00A0u) {
+            bios_a_call(gpr_[9]);
+            pc_      = gpr_[31];
+            next_pc_ = pc_ + 4u;
+            in_delay_slot_ = false;
+            return true;
+        }
+        // Sideload mode: intercept most B functions (not 0x17/0x18/0x19).
+        if (pc_ == 0x0000'00B0u) {
+            const u32 fn = gpr_[9];
+            if (fn != 0x17u && fn != 0x18u && fn != 0x19u) {
+                if (bios_b_call(fn)) {
+                    pc_      = gpr_[31];
+                    next_pc_ = pc_ + 4u;
+                    in_delay_slot_ = false;
+                    return true;
+                }
             }
         }
     }
@@ -451,24 +461,27 @@ void CPU::op_special(Instruction i) {
 
     // ── System calls ──────────────────────────────────────────────────────────
     case Funct::SYSCALL: {
-        // PSN00BSDK uses SYSCALL a0=1 / a0=2 as EnterCriticalSection /
-        // ExitCriticalSection.  We implement these by manipulating COP0.SR
-        // *before* calling exception() so that push_exception_state() captures
-        // the right IEc bit in IEp, and RFE restores it.
-        const u32 a0 = gpr_[4u];
-        if (a0 == 1u) {
-            // EnterCriticalSection: clear IEc so interrupts stay off on return.
-            cop0_.sr &= ~1u;
-        } else if (a0 == 2u) {
-            // ExitCriticalSection: set IEc (bit 0) and IM[2] (bit 10) so the
-            // hardware interrupt line is unmasked and enabled on return.
-            cop0_.sr |= 0x0401u;
+        if (!bus_.has_bios()) {
+            // Sideload mode only: PSN00BSDK uses SYSCALL a0=1 / a0=2 as
+            // EnterCriticalSection / ExitCriticalSection.  We manipulate SR
+            // *before* calling exception() so that push_exception_state()
+            // captures the right IEc bit in IEp, and RFE restores it.
+            const u32 a0 = gpr_[4u];
+            if (a0 == 1u) {
+                cop0_.sr &= ~1u;           // clear IEc
+            } else if (a0 == 2u) {
+                cop0_.sr |= 0x0401u;       // set IEc + IM[2]
+            }
         }
         exception(ExceptionCode::Syscall);
-        // exception() sets EPC = current_epc_ = pc_now (the SYSCALL address).
-        // Advance EPC past it so the sideload exception handler returns to
-        // the instruction after the SYSCALL rather than re-triggering it.
-        cop0_.epc += 4u;
+        if (!bus_.has_bios()) {
+            // Sideload mode only: advance EPC past the SYSCALL so our stub
+            // exception handler returns to the next instruction.  When a real
+            // BIOS is present, its handler advances EPC itself — doing it here
+            // too would double-skip, causing the BIOS to skip instructions
+            // after every SYSCALL (breaking CriticalSection, events, etc.).
+            cop0_.epc += 4u;
+        }
         break;
     }
     case Funct::BREAK:   exception(ExceptionCode::Bp);      break;
@@ -607,7 +620,11 @@ void CPU::op_cop0(Instruction i) {
             // Breakpoint registers — ignored in this skeleton
             break;
         case 12: cop0_.sr    = gpr_[i.rt()]; break;
-        case 13: cop0_.cause = gpr_[i.rt()]; break;
+        case 13:
+            // On R3000A only bits [9:8] (SW interrupt pending) are writable.
+            // All other Cause bits (ExcCode, BD, hardware IP) are read-only.
+            cop0_.cause = (cop0_.cause & ~0x0300u) | (gpr_[i.rt()] & 0x0300u);
+            break;
         default:
             std::fprintf(stderr, "[COP0] MTC0 to unimplemented register %u\n", i.rd());
             break;

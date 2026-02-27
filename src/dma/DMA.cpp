@@ -84,9 +84,10 @@ void DMA::write(u32 off, u32 value) noexcept {
         // is implicitly asserted when armed for VRAM readback — no bit 28 needed.
         // Exception: SPU (ch4) asserts DREQ whenever SPUCNT enables DMA mode —
         // games rely on this to trigger burst transfers without setting bit 28.
-        const bool gpu_dreq = (n == 2u) && (ch_[n].chcr & 1u);
-        const bool spu_dreq = (n == 4u);
-        const bool should_run = busy && (sync != 0 || trigger || gpu_dreq || spu_dreq);
+        const bool gpu_dreq   = (n == 2u) && (ch_[n].chcr & 1u);
+        const bool cdrom_dreq = (n == 3u);
+        const bool spu_dreq   = (n == 4u);
+        const bool should_run = busy && (sync != 0 || trigger || gpu_dreq || cdrom_dreq || spu_dreq);
 
         if (should_run && channel_enabled(n)) {
             start_transfer(n);
@@ -369,9 +370,24 @@ void DMA::finish(u32 n) noexcept {
 // Mode 0 (burst): BCR[15:0] = word count (0 → 0x10000).
 // Drains the CDRom sector buffer word-by-word into RAM at MADR.
 void DMA::run_cdrom(u32 n) noexcept {
+    // DEBUG: trace DMA ch3
+    { static int dt = 0;
+      if (++dt <= 100)
+          std::fprintf(stderr, "[DMA3] CDROM DMA: MADR=0x%08X BCR=0x%08X CHCR=0x%08X\n",
+                       ch_[n].madr, ch_[n].bcr, ch_[n].chcr); }
+
     u32 addr  = ch_[n].madr & 0x00FF'FFFFu;
-    u32 total = ch_[n].bcr  & 0xFFFFu;
-    if (total == 0u) total = 0x1'0000u;
+    const u32 sync = (ch_[n].chcr >> 9u) & 3u;
+
+    u32 total;
+    if (sync == 1u) {
+        const u32 bs = ch_[n].bcr & 0xFFFFu;
+        const u32 ba = (ch_[n].bcr >> 16u) & 0xFFFFu;
+        total = bs * ba;
+    } else {
+        total = ch_[n].bcr & 0xFFFFu;
+        if (total == 0u) total = 0x1'0000u;
+    }
 
     for (u32 i = 0u; i < total; ++i) {
         ram_.write<u32>(addr & (Ram::SIZE - 1u), cdrom_.read_data_word());

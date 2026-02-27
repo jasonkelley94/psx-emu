@@ -40,6 +40,79 @@ bash tests/run_tests.sh
 
 ## Recent Fixes
 
+### SPU — Dedicated Module (`src/spu/SPU.cpp`)
+
+Replaced the inline `spu_regs_[]` passthrough in Bus with a standalone `SPU` class
+(`src/spu/SPU.hpp`, `src/spu/SPU.cpp`).  Key features:
+
+- 24-voice ADPCM decoding with pitch and ADSR envelope
+- 512 KB SPU RAM with PIO and DMA transfer support
+- SPUSTAT mirroring of SPUCNT bits [5:0]
+- SDL2 audio output at 44.1 kHz (stereo S16)
+- SPU ticked at ~768 CPU cycles per sample from `Bus::tick()`
+
+---
+
+### Controller / Keyboard Input (`src/display/Display.cpp`)
+
+Wired keyboard and SDL2 GameController input to the joypad state machine.
+Both keyboard and gamepad are polled (not event-driven) and merged via
+bitwise AND (either device can press any button).
+
+- **Keyboard**: WASD = D-pad, IJKL = Triangle/Cross/Circle/Square,
+  Q/E = L1/L2, U/O = R1/R2, Enter = Start, RShift = Select
+- **Gamepad**: SDL2 GameController API (DualShock/DualSense/Xbox auto-mapped),
+  analog triggers digitized at 25% threshold
+- Hot-plug: `SDL_CONTROLLERDEVICEADDED` / `SDL_CONTROLLERDEVICEREMOVED` handled
+- `Display::buttons()` → `Bus::set_buttons()` wired in main loop
+
+---
+
+### DMA ch3 (CD-ROM) — BCR Slice Mode Fix
+
+CD-ROM DMA now correctly handles sync mode 1 (slice): total words =
+`block_size × block_count` instead of just `BCR[15:0]`.  Also added
+`cdrom_dreq` flag so ch3 burst transfers start without requiring bit 28
+(trigger), matching GPU/SPU DREQ behavior.
+
+---
+
+### Display — RGB Channel Order Fix
+
+Fixed red/blue swap in `Display::present()`: was `0xFF | B<<16 | G<<8 | R`,
+now correctly `0xFF | R<<16 | G<<8 | B` (ARGB8888 format).
+
+---
+
+### IRQ — 16-bit Write Support
+
+Added `io_write16` handlers for I_STAT (0x1F801070) and I_MASK (0x1F801074).
+Some games/BIOS code writes these as halfwords rather than full words.
+
+---
+
+### Cache Control Register Address Fix
+
+`CACHE_CTL` corrected from `0xFFFE'0000` to `0xFFFE'0130` (the actual
+KSEG2 cache control register address on PSX).
+
+---
+
+### Crash Bandicoot — Boot Investigation (in progress)
+
+Game boots to the "opening symbol" screen but does not progress further.
+Investigation traced the issue to the BIOS exception handler:
+
+- CD-ROM command/response flow is correct (33 responses delivered, no overwrites)
+- BIOS reads 8 boot sectors, sends GetID — all acknowledged except final 2 responses
+- Root cause: CPU stuck in exception handler with `COP0_SR.IEc=0` permanently
+- I_STAT shows VBlank + DMA always pending; likely interrupt storm prevents
+  CDROM GetID response from being serviced
+- **Next step**: add ExcCode trace to identify the exception type causing the loop,
+  then check VBlank/DMA firing frequency
+
+---
+
 ### Test Automation — ps1-tests runner + GitHub Actions CI
 
 Added `tests/run_tests.sh`, `tests/fetch_tests.sh`, and `.github/workflows/ci.yml`.
@@ -134,24 +207,30 @@ Dotclock: `cycles / div` → `cycles * 11 / (div * 7)` (PSX pixel clock = sys ×
 
 ## Known Issues / Next Work
 
-### 1. dma/dpcr — needs SPU DMA ch4
-DMA channel 4 (SPU) is stubbed to no-op.  Will be addressed when SPU RAM is implemented.
+### 1. Crash Bandicoot Boot — Exception Handler Loop
+CPU gets stuck in the BIOS exception handler (IEc=0 permanently) after CD-ROM
+GetID.  VBlank + DMA interrupts are always pending in I_STAT, suggesting an
+interrupt storm that prevents the CDROM response from being serviced.
+Next: add ExcCode trace, check VBlank/DMA assertion frequency.
 
-### 2. SPU — Minimal Stub Only
-24-voice synthesis, ADSR, pitch, reverb not implemented.  Register file passthrough
-(`spu_regs_[0x280]`) is sufficient for the automated tests.
+### 2. SPU — Partial Implementation
+24-voice ADPCM, basic ADSR, pitch, and SDL audio output implemented.
+Reverb, noise generator, and CD audio input mixing not yet done.
 
-Remaining work for full coverage:
-- SPU RAM buffer (512 KB at 0x1F801DA6/0x1F801DA8 transfer interface)
-- DMA ch4 actual data transfer (SPU RAM ↔ main RAM)
-- SPUSTAT[5:0] mirroring SPUCNT[5:0]
+### 3. dma/dpcr — needs SPU DMA ch4
+DMA ch4 (SPU) data transfers implemented but dpcr test still pending.
 
-### 3. GPU Visual Tests — Not Pixel-Compared
+### 4. GPU Visual Tests — Not Pixel-Compared
 15 GPU visual tests (`triangle`, `quad`, `rectangles`, `lines`, etc.) produce VRAM dumps
 but have not been compared against reference PNGs.
 
-### 4. MDEC — Not Implemented
+### 5. MDEC — Not Implemented
 Hardware JPEG-like decoder.  Needed for 9 MDEC tests.
+
+### 6. Debug Traces — Need Cleanup
+Several temporary debug traces remain in the codebase (joypad read/write traces
+in Bus.cpp, DMA ch3 trace, CDROM response trace, IRQ counter, CPU check_irq
+trace).  These should be removed before any release.
 
 ---
 
@@ -174,7 +253,8 @@ Hardware JPEG-like decoder.  Needed for 9 MDEC tests.
 ### Display (`src/display/Display.cpp`)
 - SDL2 streaming texture (1024×512 ARGB8888)
 - `present()` crops to GPU active display area using a source `SDL_Rect`
-- `SDL_RenderSetLogicalSize` maintains aspect ratio on window resize
+- Keyboard + SDL2 GameController input (WASD/IJKL + DualShock/Xbox auto-mapped)
+- Controller hot-plug support via SDL events
 
 ### Timers (`src/timers/Timers.cpp`)
 - Three 16-bit counters; sys / dot / HBlank-count / sys/8 clock sources
@@ -184,9 +264,11 @@ Hardware JPEG-like decoder.  Needed for 9 MDEC tests.
 
 ### DMA (`src/dma/DMA.cpp`)
 - OTC (ch6) ✓, GPU LL (ch2) ✓, GPU VRAM (ch2 sync=2) ✓
+- CD-ROM (ch3) ✓ — burst and slice mode, DREQ auto-start
+- SPU (ch4) ✓ — main RAM ↔ SPU RAM transfer
 - Chopping mode ✓ (burst interleave with CPU cycle credits)
 - Chain-end detection + DMA IRQ ✓
-- Channels 0, 1, 4, 5: stub — immediately finish to prevent hangs
+- Channels 0, 1, 5: stub — immediately finish to prevent hangs
 
 ### CDROM (`src/cdrom/CDRom.cpp`)
 - Commands: GetStat, Setloc, ReadN/S, Stop, Pause, Init, Mute/Demute, Setmode,
@@ -195,9 +277,11 @@ Hardware JPEG-like decoder.  Needed for 9 MDEC tests.
 - XA-ADPCM decode: sub-header detection, 4-bit IIR filter, PCM ring buffer
 - Timing: kAck1=50K, kAck1Read=35K, kSect1_1x=5M, kSectN_1x=448K cycles
 
-### SPU (`src/bus/Bus.cpp`)
-- Register file passthrough via `spu_regs_[0x280]` covering 0x1F801C00–0x1F801E7F
-- No actual synthesis, no SPU RAM, no DMA data transfer
+### SPU (`src/spu/SPU.cpp`, `src/spu/SPU.hpp`)
+- 24-voice ADPCM decoding with pitch modulation and basic ADSR envelope
+- 512 KB SPU RAM; PIO transfers via SPUADDR/SPUDATA, DMA via ch4
+- SPUSTAT mirrors SPUCNT bits [5:0]; SDL2 audio output at 44.1 kHz stereo
+- Ticked from Bus at ~768 CPU cycles per sample
 
 ### Joypad (`src/bus/Bus.cpp`)
 - SIO0 digital pad fully implemented (all 16 buttons); IRQ on each byte exchange

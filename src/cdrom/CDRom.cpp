@@ -65,6 +65,14 @@ static void xa_decode_block(const u8* data, u32 shift, u32 filter,
 
 // ── Multi-byte response + fire CDRom IRQ immediately ─────────────────────────
 void CDRom::push_response_n(u8 int_type, const u8* data, u32 len) noexcept {
+    // DEBUG: log every response delivery
+    { static u32 rn = 0;
+      ++rn;
+      if (rn <= 50u)
+          std::fprintf(stderr, "[CDROM-RSP] #%u INT%u len=%u d0=0x%02X irq_fl_was=%u irq_en=0x%02X\n",
+                       rn, int_type & 0x07u, len,
+                       (data && len > 0) ? data[0] : 0u, irq_fl_, irq_en_);
+    }
     resp_len_ = static_cast<u8>(len < 8u ? len : 8u);
     for (u32 i = 0u; i < static_cast<u32>(resp_len_); ++i)
         resp_[i] = data[i];
@@ -439,6 +447,12 @@ bool CDRom::read_sector() noexcept {
     loc_valid_  = true;
     pos_valid_  = true;
     pos_lba_    = loc_lba_;
+
+    // DEBUG: trace sector reads
+    { static int sr = 0;
+      if (++sr <= 100)
+          std::fprintf(stderr, "[CDROM] read_sector LBA=%d (data_ready=1)\n", loc_lba_); }
+
     return true;
 }
 
@@ -553,6 +567,13 @@ void CDRom::handle_command(u8 cmd) noexcept {
     const u8 p0 = (param_len_ > 0u) ? params_[0] : 0u;
     const u8 p1 = (param_len_ > 1u) ? params_[1] : 0u;
     const u8 p2 = (param_len_ > 2u) ? params_[2] : 0u;
+
+    // DEBUG: trace CD-ROM commands
+    { static int cc = 0;
+      if (++cc <= 200)
+          std::fprintf(stderr, "[CDROM] cmd=0x%02X p0=0x%02X p1=0x%02X p2=0x%02X (stat=0x%02X)\n",
+                       cmd, p0, p1, p2, cd_stat_); }
+
     param_len_ = 0u;
 
     switch (cmd) {
@@ -824,6 +845,14 @@ void CDRom::handle_command(u8 cmd) noexcept {
     case 0x1C:
     case 0x1D:
         sched1(3u, cd_stat_, kAck1);
+        break;
+
+    // ── 0x1E ReadTOC — re-read the disc Table of Contents (stub) ──────────
+    // Real hardware re-reads the TOC from the disc; we already have it parsed.
+    // INT3 (acknowledge) then INT2 (complete) with the usual delays.
+    case 0x1E:
+        sched1(3u, cd_stat_, kAck1);
+        sched2(2u, &cd_stat_, 1u, kD2Init);
         break;
 
     // ── Unknown command — INT5 error ──────────────────────────────────────────

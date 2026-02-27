@@ -10,6 +10,7 @@
 #include "dma/DMA.hpp"
 #include "cdrom/CDRom.hpp"
 #include "timers/Timers.hpp"
+#include "spu/SPU.hpp"
 
 // ── Bus ───────────────────────────────────────────────────────────────────────
 // Central interconnect.  Owns all memory-mapped components and routes CPU
@@ -44,6 +45,7 @@ public:
 
     // ── IRQ query (used by the CPU before each instruction fetch) ─────────────
     [[nodiscard]] bool irq_pending() const noexcept { return irq_->irq_pending(); }
+    [[nodiscard]] u32  irq_read_stat() const noexcept { return irq_->read_stat(); }
 
     // ── TTY output ────────────────────────────────────────────────────────────
     // Shared by the SIO1 byte-write path (io_write8) and the BIOS A-function
@@ -68,9 +70,14 @@ public:
     // Direct component access for the debugger / test harness
     [[nodiscard]] Ram&    ram()   noexcept { return *ram_; }
     [[nodiscard]] GPU&    gpu()   noexcept { return *gpu_; }
+    [[nodiscard]] bool    has_bios() const noexcept { return bios_ != nullptr; }
     [[nodiscard]] IRQ&    irq()   noexcept { return *irq_; }
     [[nodiscard]] CDRom&  cdrom() noexcept { return *cdrom_; }
     [[nodiscard]] DMA&    dma()   noexcept { return *dma_; }
+    [[nodiscard]] SPU&    spu()   noexcept { return *spu_; }
+
+    // ── Joypad input ────────────────────────────────────────────────────────
+    void set_buttons(u16 b) noexcept { joy_.buttons = b; }
 
 private:
     // ── Owned components ──────────────────────────────────────────────────────
@@ -81,6 +88,7 @@ private:
     std::unique_ptr<IRQ>   irq_;
     std::unique_ptr<CDRom>   cdrom_;    // after irq_ (holds irq_ reference)
     std::unique_ptr<Timers>  timers_;   // after irq_
+    std::unique_ptr<SPU>     spu_;      // after irq_
 
     // SPU RAM — 512 KB audio sample buffer shared with DMA ch4.
     // Declared before dma_ so it is initialised before the DMA constructor
@@ -169,6 +177,9 @@ private:
     u32 hblank_cycles_  = 0;
     u32 hblank_active_  = 0;   // cycles since HBlank start; 0 = outside HBlank
     bool in_hblank_     = false;
+
+    // SPU runs at 44.1kHz ≈ every 768 CPU cycles (33.868MHz / 44100).
+    u32 spu_cycles_     = 0;
 
     // ── MMIO helpers ─────────────────────────────────────────────────────────
     // Most I/O registers are 32-bit wide; the CD-ROM is the exception (8-bit).

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 // The display window is 2× the native VRAM size for legibility.
@@ -14,10 +15,13 @@ namespace {
 }
 
 Display::Display() {
-    // Force X11 driver explicitly for VMware compatibility
-    SDL_setenv("SDL_VIDEODRIVER", "x11", 1);
+    // Try to use X11 driver for better VMware compatibility
+    // Must be set before SDL_Init
+    if (std::getenv("SDL_VIDEODRIVER") == nullptr) {
+        SDL_setenv("SDL_VIDEODRIVER", "x11", 0);
+    }
 
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "[Display] SDL_Init failed: %s\n", SDL_GetError());
         return;
     }
@@ -50,21 +54,112 @@ Display::Display() {
     if (!texture_) {
         std::fprintf(stderr, "[Display] SDL_CreateTexture failed: %s\n", SDL_GetError());
     }
+
+    // Open the first available game controller (DualShock, Xbox, etc.).
+    for (int i = 0; i < SDL_NumJoysticks(); ++i) {
+        if (SDL_IsGameController(i)) {
+            controller_ = SDL_GameControllerOpen(i);
+            if (controller_) {
+                std::fprintf(stdout, "[Input] Controller: %s\n",
+                             SDL_GameControllerName(controller_));
+                break;
+            }
+        }
+    }
 }
 
 Display::~Display() {
-    if (texture_)  SDL_DestroyTexture(texture_);
-    if (renderer_) SDL_DestroyRenderer(renderer_);
-    if (window_)   SDL_DestroyWindow(window_);
+    if (controller_) SDL_GameControllerClose(controller_);
+    if (texture_)    SDL_DestroyTexture(texture_);
+    if (renderer_)   SDL_DestroyRenderer(renderer_);
+    if (window_)     SDL_DestroyWindow(window_);
     SDL_Quit();
 }
 
 bool Display::poll_events() noexcept {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) return false;
-        if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) return false;
+        switch (ev.type) {
+        case SDL_QUIT:
+            return false;
+        case SDL_KEYDOWN:
+            if (ev.key.keysym.sym == SDLK_ESCAPE) return false;
+            break;
+        case SDL_CONTROLLERDEVICEADDED:
+            if (!controller_) {
+                controller_ = SDL_GameControllerOpen(ev.cdevice.which);
+                if (controller_)
+                    std::fprintf(stdout, "[Input] Controller connected: %s\n",
+                                 SDL_GameControllerName(controller_));
+            }
+            break;
+        case SDL_CONTROLLERDEVICEREMOVED:
+            if (controller_ &&
+                SDL_GameControllerFromInstanceID(ev.cdevice.which) == controller_) {
+                std::fprintf(stdout, "[Input] Controller disconnected\n");
+                SDL_GameControllerClose(controller_);
+                controller_ = nullptr;
+            }
+            break;
+        default:
+            break;
+        }
     }
+
+    // ── Sample input state (polled, not event-driven) ───────────────────────
+    // Active-low: 0 = pressed, 1 = released.  Keyboard and controller are
+    // merged via bitwise AND so either device can press any button.
+    // Helper: clear bit N in a u16 (marks button as pressed).
+    auto clr = [](u16& w, unsigned bit) { w &= static_cast<u16>(~(1u << bit)); };
+
+    u16 b = 0xFFFFu;
+
+    // Keyboard: WASD + IJKL layout
+    const u8* key = SDL_GetKeyboardState(nullptr);
+    if (key[SDL_SCANCODE_RETURN])  clr(b, 3);   // Start
+    if (key[SDL_SCANCODE_RSHIFT])  clr(b, 0);   // Select
+    if (key[SDL_SCANCODE_W])       clr(b, 4);   // D-pad Up
+    if (key[SDL_SCANCODE_S])       clr(b, 6);   // D-pad Down
+    if (key[SDL_SCANCODE_A])       clr(b, 7);   // D-pad Left
+    if (key[SDL_SCANCODE_D])       clr(b, 5);   // D-pad Right
+    if (key[SDL_SCANCODE_K])       clr(b, 14);  // Cross  (X)
+    if (key[SDL_SCANCODE_L])       clr(b, 13);  // Circle (O)
+    if (key[SDL_SCANCODE_I])       clr(b, 12);  // Triangle
+    if (key[SDL_SCANCODE_J])       clr(b, 15);  // Square
+    if (key[SDL_SCANCODE_Q])       clr(b, 10);  // L1
+    if (key[SDL_SCANCODE_E])       clr(b, 8);   // L2
+    if (key[SDL_SCANCODE_U])       clr(b, 11);  // R1
+    if (key[SDL_SCANCODE_O])       clr(b, 9);   // R2
+
+    // Game controller (DualShock / Xbox / etc.)
+    if (controller_) {
+        auto pressed = [&](SDL_GameControllerButton btn) {
+            return SDL_GameControllerGetButton(controller_, btn) != 0;
+        };
+        if (pressed(SDL_CONTROLLER_BUTTON_START))         clr(b, 3);
+        if (pressed(SDL_CONTROLLER_BUTTON_BACK))          clr(b, 0);
+        if (pressed(SDL_CONTROLLER_BUTTON_DPAD_UP))       clr(b, 4);
+        if (pressed(SDL_CONTROLLER_BUTTON_DPAD_DOWN))     clr(b, 6);
+        if (pressed(SDL_CONTROLLER_BUTTON_DPAD_LEFT))     clr(b, 7);
+        if (pressed(SDL_CONTROLLER_BUTTON_DPAD_RIGHT))    clr(b, 5);
+        if (pressed(SDL_CONTROLLER_BUTTON_A))             clr(b, 14);  // Cross
+        if (pressed(SDL_CONTROLLER_BUTTON_B))             clr(b, 13);  // Circle
+        if (pressed(SDL_CONTROLLER_BUTTON_Y))             clr(b, 12);  // Triangle
+        if (pressed(SDL_CONTROLLER_BUTTON_X))             clr(b, 15);  // Square
+        if (pressed(SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  clr(b, 10);  // L1
+        if (pressed(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) clr(b, 11);  // R1
+        if (pressed(SDL_CONTROLLER_BUTTON_LEFTSTICK))     clr(b, 1);   // L3
+        if (pressed(SDL_CONTROLLER_BUTTON_RIGHTSTICK))    clr(b, 2);   // R3
+
+        // Analog triggers → digital: threshold at ~25% pull
+        constexpr s16 kTriggerThreshold = 8000;
+        if (SDL_GameControllerGetAxis(controller_, SDL_CONTROLLER_AXIS_TRIGGERLEFT)  > kTriggerThreshold)
+            clr(b, 8);   // L2
+        if (SDL_GameControllerGetAxis(controller_, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > kTriggerThreshold)
+            clr(b, 9);   // R2
+    }
+
+    buttons_ = b;
     return true;
 }
 
@@ -92,7 +187,7 @@ void Display::present(const GPU& gpu) noexcept {
             const uint32_t r8 = (r5 << 3u) | (r5 >> 2u);
             const uint32_t g8 = (g5 << 3u) | (g5 >> 2u);
             const uint32_t b8 = (b5 << 3u) | (b5 >> 2u);
-            dst[y * row_words + x] = 0xFF000000u | (b8 << 16u) | (g8 << 8u) | r8;
+            dst[y * row_words + x] = 0xFF000000u | (r8 << 16u) | (g8 << 8u) | b8;
         }
     }
 
